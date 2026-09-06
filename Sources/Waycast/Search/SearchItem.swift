@@ -14,8 +14,21 @@ struct SearchItem: Identifiable, Hashable {
     let id: String          // file path (unique)
     let kind: Kind
     let title: String
+    /// Secondary name to match against (e.g. the English bundle name of an
+    /// app whose title is localized: title="磁盘工具", altName="Disk Utility").
+    let altName: String?
     let subtitle: String    // directory path
     let url: URL
+
+    init(id: String, kind: Kind, title: String, altName: String? = nil,
+         subtitle: String, url: URL) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.altName = altName
+        self.subtitle = subtitle
+        self.url = url
+    }
 
     static func == (lhs: SearchItem, rhs: SearchItem) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }

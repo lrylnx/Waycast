@@ -59,8 +59,18 @@ final class SearchEngine {
                 let path = dir + "/" + entry
                 let id = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
                 guard seen.insert(id).inserted else { continue }
-                let name = (entry as NSString).deletingPathExtension
-                items.append(SearchItem(id: id, kind: .app, title: name,
+                let enName = (entry as NSString).deletingPathExtension
+                // Localized display name (e.g. "磁盘工具" for Disk Utility.app).
+                // Only Spotlight/LSCopy expose it; FileManager.localizedName
+                // and Bundle return the English name.
+                var displayName = enName
+                if let md = MDItemCreate(kCFAllocatorDefault, path as CFString),
+                   let dn = MDItemCopyAttribute(md, kMDItemDisplayName) as? String,
+                   !dn.isEmpty {
+                    displayName = (dn as NSString).deletingPathExtension
+                }
+                items.append(SearchItem(id: id, kind: .app, title: displayName,
+                                        altName: displayName == enName ? nil : enName,
                                         subtitle: dir,
                                         url: URL(fileURLWithPath: path)))
             }
@@ -113,15 +123,22 @@ final class SearchEngine {
         let tokens = q.split(separator: " ").map(String.init)
         var scored: [(Int, SearchItem)] = []
         for item in appIndex {
-            let name = item.title.lowercased()
-            let stem = name.replacingOccurrences(of: " ", with: "")
-            var score = 0
-            if name == q { score = 1000 }
-            else if name.hasPrefix(q) { score = 800 }
-            else if stem.hasPrefix(q) { score = 700 }
-            else if name.contains(q) { score = 500 }
-            else if !tokens.isEmpty, tokens.allSatisfy({ name.contains($0) }) { score = 300 }
-            else if isSubsequence(q.replacingOccurrences(of: " ", with: ""), in: stem) { score = 100 }
+            // Match against BOTH the localized title (磁盘工具) and the
+            // English alt name (Disk Utility); keep the better score.
+            var best = 0
+            for name0 in [item.title, item.altName ?? ""] where !name0.isEmpty {
+                let name = name0.lowercased()
+                let stem = name.replacingOccurrences(of: " ", with: "")
+                var score = 0
+                if name == q { score = 1000 }
+                else if name.hasPrefix(q) { score = 800 }
+                else if stem.hasPrefix(q) { score = 700 }
+                else if name.contains(q) { score = 500 }
+                else if !tokens.isEmpty, tokens.allSatisfy({ name.contains($0) }) { score = 300 }
+                else if isSubsequence(q.replacingOccurrences(of: " ", with: ""), in: stem) { score = 100 }
+                best = max(best, score)
+            }
+            var score = best
             if score > 0 {
                 if item.subtitle.hasPrefix("/System") { score -= 40 }
                 scored.append((score, item))
