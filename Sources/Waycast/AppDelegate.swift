@@ -1,0 +1,154 @@
+import Cocoa
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    static var shared: AppDelegate!
+
+    let settings = AppSettings.shared
+    private(set) var statusItem: NSStatusItem!
+
+    // Feature controllers
+    private(set) lazy var searchController = SpotlightController()
+    private(set) lazy var screenshotController = ScreenshotController()
+    private(set) lazy var clipboardController = ClipboardController()
+
+    private var hotkeyManager: HotkeyManager!
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.mainMenu = buildMainMenu()
+
+        hotkeyManager = HotkeyManager()
+        setupStatusItem()
+        registerHotkeys()
+        clipboardController.start()
+
+        // Warm up the app index and Spotlight so the first invocation is fast.
+        searchController.warmUp()
+
+        // First-run guidance for required permissions.
+        if !CGPreflightScreenCaptureAccess() {
+            showScreenCapturePermissionAlert()
+        }
+    }
+
+    /// Minimal main menu. Accessory apps get no default menu, which is why
+    /// ⌘C/⌘A in the OCR text view did nothing — those are menu-driven key
+    /// equivalents. autoenablesItems stays ON so items only fire when the
+    /// first responder actually implements the action (the overlay's own
+    /// ⌘C/⌘Z handlers in keyDown keep working otherwise).
+    private func buildMainMenu() -> NSMenu {
+        let main = NSMenu()
+
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let edit = NSMenu(title: "编辑")
+        editItem.submenu = edit
+        edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        let winItem = NSMenuItem()
+        main.addItem(winItem)
+        let win = NSMenu(title: "窗口")
+        winItem.submenu = win
+        win.addItem(withTitle: "关闭", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+
+        return main
+    }
+
+    // MARK: - Status bar
+
+    private func setupStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            let image = NSImage(systemSymbolName: "bolt.horizontal.circle",
+                                accessibilityDescription: "Waycast")
+            image?.isTemplate = true
+            button.image = image
+        }
+        statusItem.menu = buildStatusMenu()
+    }
+
+    private func buildStatusMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        let search = NSMenuItem(title: "搜索  ⌥Space", action: #selector(showSearch), keyEquivalent: "")
+        search.target = self
+        menu.addItem(search)
+
+        let shot = NSMenuItem(title: "截图  F1", action: #selector(startScreenshot), keyEquivalent: "")
+        shot.target = self
+        menu.addItem(shot)
+
+        let pin = NSMenuItem(title: "贴图  F3", action: #selector(startPinCapture), keyEquivalent: "")
+        pin.target = self
+        menu.addItem(pin)
+
+        menu.addItem(.separator())
+
+        let clip = NSMenuItem(title: "剪贴板历史", action: nil, keyEquivalent: "")
+        clip.submenu = clipboardController.menu
+        menu.addItem(clip)
+
+        menu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        let quit = NSMenuItem(title: "退出 Waycast", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        return menu
+    }
+
+    // MARK: - Hotkeys
+
+    func registerHotkeys() {
+        hotkeyManager.unregisterAll()
+        hotkeyManager.register(id: .search, config: settings.searchHotkey) {
+            Task { @MainActor in self.searchController.toggle() }
+        }
+        hotkeyManager.register(id: .screenshot, config: settings.screenshotHotkey) {
+            Task { @MainActor in self.screenshotController.start(mode: .annotate) }
+        }
+        hotkeyManager.register(id: .pin, config: settings.pinHotkey) {
+            Task { @MainActor in self.screenshotController.start(mode: .pin) }
+        }
+    }
+
+    @objc private func showSearch() { searchController.toggle() }
+    @objc private func startScreenshot() { screenshotController.start(mode: .annotate) }
+    @objc private func startPinCapture() { screenshotController.start(mode: .pin) }
+
+    @objc private func openSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        SettingsWindowController.shared.show()
+    }
+
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    // MARK: - Permissions
+
+    private func showScreenCapturePermissionAlert() {
+        let alert = NSAlert()
+        alert.messageText = "需要屏幕录制权限"
+        alert.informativeText = "截图功能需要「屏幕录制」权限。\n请在 系统设置 › 隐私与安全性 › 屏幕录制 中勾选 Waycast，然后重新启动应用。"
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "稍后")
+        alert.alertStyle = .warning
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
