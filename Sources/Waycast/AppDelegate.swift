@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) lazy var clipboardController = ClipboardController()
 
     private var hotkeyManager: HotkeyManager!
+    private weak var waterlineItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
@@ -65,14 +66,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Status bar
 
     private func setupStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "bolt.horizontal.circle",
-                                accessibilityDescription: "Waycast")
-            image?.isTemplate = true
-            button.image = image
+            button.image = Self.defaultStatusImage()
         }
         statusItem.menu = buildStatusMenu()
+
+        // Memory waterline icon (opt-in): pushes new frames into the button,
+        // nil restores the default bolt.
+        MemoryWaterline.shared.onIconUpdate = { [weak self] image in
+            self?.statusItem.button?.image = image ?? Self.defaultStatusImage()
+        }
+        MemoryWaterline.shared.onChange = { [weak self] in
+            self?.waterlineItem?.state = MemoryWaterline.shared.isEnabled ? .on : .off
+        }
+    }
+
+    private static func defaultStatusImage() -> NSImage? {
+        let image = NSImage(systemSymbolName: "bolt.horizontal.circle",
+                            accessibilityDescription: "Waycast")
+        image?.isTemplate = true
+        return image
     }
 
     private func buildStatusMenu() -> NSMenu {
@@ -100,6 +114,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         InputSourceLock.shared.onChange = { [weak lock] in
             lock?.state = InputSourceLock.shared.isLocked ? .on : .off
         }
+
+        // 勾选后状态栏换成内存水位杯图标，再点一次切回默认闪电图标。
+        let water = NSMenuItem(title: "内存水位图标", action: #selector(toggleWaterline), keyEquivalent: "")
+        water.target = self
+        water.state = MemoryWaterline.shared.isEnabled ? .on : .off
+        menu.addItem(water)
+        waterlineItem = water
 
         menu.addItem(.separator())
 
@@ -139,6 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func startScreenshot() { screenshotController.start(mode: .annotate) }
     @objc private func startPinCapture() { screenshotController.start(mode: .pin) }
     @objc private func toggleInputLock() { InputSourceLock.shared.toggle() }
+    @objc private func toggleWaterline() { MemoryWaterline.shared.toggle() }
 
     @objc private func openSettings() {
         NSApp.activate(ignoringOtherApps: true)

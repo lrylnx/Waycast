@@ -49,6 +49,12 @@ final class AppSettings {
         set { defaults.set(newValue, forKey: "searchScopePaths") }
     }
 
+    /// Status bar shows the memory waterline cup icon instead of the bolt.
+    var statusIconWaterline: Bool {
+        get { defaults.bool(forKey: "statusIconWaterline") }
+        set { defaults.set(newValue, forKey: "statusIconWaterline") }
+    }
+
     // MARK: - Search panel position (remembered per display)
 
     /// Stable-ish key for a display: name + pixel size. Survives re-plugging
