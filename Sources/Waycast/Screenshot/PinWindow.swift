@@ -4,7 +4,7 @@ import Carbon.HIToolbox
 /// A borderless floating window that "pins" a captured image onto the screen.
 /// Draggable, scroll-to-zoom, double-click or Esc to dismiss.
 final class PinWindow: NSWindow {
-    private let image: CGImage
+    private var image: CGImage?
     private var baseSize: NSSize
 
     init(image: CGImage, contentSize: NSSize) {
@@ -40,7 +40,13 @@ final class PinWindow: NSWindow {
     /// for borderless windows released from menu-tracking / queue-drain
     /// contexts, was crashing the app (objc_release SIGSEGV). orderOut just
     /// hides; the manager parks the window so it never deallocates.
+    ///
+    /// Before parking we drop the (potentially multi-megabyte) captured image
+    /// so a long-lived session that pins many screenshots doesn't accumulate
+    /// them in memory — only an empty window shell is parked.
     fileprivate func dismissPin() {
+        image = nil
+        (contentView as? PinImageView)?.releaseImage()
         PinWindowManager.shared.windowClosed(self)
         orderOut(nil)
     }
@@ -62,7 +68,7 @@ final class PinWindow: NSWindow {
 }
 
 final class PinImageView: NSView {
-    let image: CGImage
+    var image: CGImage?
     var onDismiss: (() -> Void)?
     var onZoom: ((CGFloat) -> Void)?
 
@@ -74,7 +80,14 @@ final class PinImageView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Drop the captured bitmap once the pin is closed (parked shells stay
+    /// alive to avoid an unsafe NSWindow dealloc, but must not keep the pixels).
+    func releaseImage() {
+        image = nil
+    }
+
     override func draw(_ dirtyRect: NSRect) {
+        guard let image else { return }
         NSImage(cgImage: image, size: bounds.size).draw(in: bounds)
     }
 
@@ -100,7 +113,7 @@ final class PinImageView: NSView {
     }
 
     @objc private func copyImage() {
-        guard let data = ImageProcessor.pngData(image) else { return }
+        guard let image, let data = ImageProcessor.pngData(image) else { return }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setData(data, forType: .png)

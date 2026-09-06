@@ -93,6 +93,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let lock = NSMenuItem(title: "锁定输入法", action: #selector(toggleInputLock), keyEquivalent: "")
+        lock.target = self
+        lock.state = InputSourceLock.shared.isLocked ? .on : .off
+        menu.addItem(lock)
+        InputSourceLock.shared.onChange = { [weak lock] in
+            lock?.state = InputSourceLock.shared.isLocked ? .on : .off
+        }
+
+        menu.addItem(.separator())
+
         let clip = NSMenuItem(title: "剪贴板历史", action: nil, keyEquivalent: "")
         clip.submenu = clipboardController.menu
         menu.addItem(clip)
@@ -128,6 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showSearch() { searchController.toggle() }
     @objc private func startScreenshot() { screenshotController.start(mode: .annotate) }
     @objc private func startPinCapture() { screenshotController.start(mode: .pin) }
+    @objc private func toggleInputLock() { InputSourceLock.shared.toggle() }
 
     @objc private func openSettings() {
         NSApp.activate(ignoringOtherApps: true)
