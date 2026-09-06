@@ -118,13 +118,12 @@ final class SpotlightController: NSObject {
             }
     }
 
-    /// Once results exist, clicking anywhere outside the panel dismisses it
-    /// (Spotlight behavior). While there are no results the panel stays open.
+    /// Clicking anywhere outside the panel dismisses it — exactly like
+    /// Spotlight, whether or not there are results.
     private func installClickMonitors() {
         removeClickMonitors()
         let handle: (NSEvent) -> NSEvent? = { [weak self] event in
             guard let self, let panel = self.panel, panel.isVisible else { return event }
-            guard !self.viewModel.allResults.isEmpty else { return event }
             let inWindow = event.window === panel
             let location = NSEvent.mouseLocation
             let outside = !panel.frame.contains(location)
@@ -184,6 +183,12 @@ final class SpotlightController: NSObject {
         removeKeyMonitor()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self else { return event }
+            // While an IME composition is active (pinyin marked text on screen),
+            // Return/arrows/Esc belong to the input method: Return commits the
+            // typed letters, arrows move through candidates, Esc cancels the
+            // composition. Intercepting them here is what made Return "do
+            // nothing" in the search field with a Chinese IME.
+            if self.isIMEComposing() { return event }
             switch event.keyCode {
             case UInt16(kVK_Escape):
                 self.hide()
@@ -214,6 +219,16 @@ final class SpotlightController: NSObject {
     private func removeKeyMonitor() {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         if let m = globalKeyMonitor { NSEvent.removeMonitor(m); globalKeyMonitor = nil }
+    }
+
+    /// True while an input-method composition is in flight (e.g. pinyin
+    /// letters underlined in the search field). The field editor — an
+    /// NSTextView — holds the marked text range.
+    private func isIMEComposing() -> Bool {
+        guard let panel else { return false }
+        if let tv = panel.firstResponder as? NSTextView,
+           tv.markedRange().location != NSNotFound { return true }
+        return false
     }
 }
 
