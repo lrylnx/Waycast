@@ -24,6 +24,8 @@ final class ScreenshotController: NSObject {
     private var screen: NSScreen?
     private var desktopImage: CGImage?
     private var pixelatedCache: CGImage?
+    private var keyRetryWork: DispatchWorkItem?
+    private var escMonitor: Any?
 
     func start(mode: Mode) {
         guard overlayWindow == nil else { return }   // already running
@@ -77,6 +79,8 @@ final class ScreenshotController: NSObject {
             guard let self, self.mode == .pin, let model = self.overlayView?.model else { return }
             self.pinSelection(model: model)
         }
+        // Right-click anywhere = escape hatch, works even without keyboard focus.
+        view.onCancelByRightClick = { [weak self] in self?.cancel() }
 
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
@@ -90,6 +94,53 @@ final class ScreenshotController: NSObject {
         } else {
             // Pin mode: select a region, then double-click or press Enter to pin.
             Toast.show("框选要贴图的区域，双击或回车确认")
+        }
+
+        // A hotkey pressed while the status menu is still open runs beginSession
+        // INSIDE the menu's nested tracking loop, so makeKeyAndOrderFront silently
+        // fails — the overlay shows but never becomes key, and Esc/⌘Z (which arrive
+        // through keyDown) are lost. That left a full-screen screenSaver-level
+        // window the user could not dismiss. Arm a watchdog that keeps re-asserting
+        // key focus until the menu releases it, and tears the session down if it
+        // never can, so the screen is never left frozen.
+        armKeyWindowWatchdog(for: window)
+        installEscFallback()
+    }
+
+    /// Retry activation until the overlay is actually key; give up (and tear down)
+    /// rather than strand the user behind an unfocusable full-screen window.
+    private func armKeyWindowWatchdog(for window: NSWindow, attempts: Int = 12) {
+        keyRetryWork?.cancel()
+        guard attempts > 0 else {
+            // Still not key after ~1.8s of retries — the session is unusable.
+            // Close it so the desktop is interactive again.
+            teardown()
+            Toast.show("截图已取消，请稍后重试")
+            return
+        }
+        let work = DispatchWorkItem { [weak self, weak window] in
+            guard let self, let window, self.overlayWindow === window else { return }
+            if window.isKeyWindow { return }        // focus acquired, done
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(self.overlayView)
+            self.armKeyWindowWatchdog(for: window, attempts: attempts - 1)
+        }
+        keyRetryWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    /// Belt-and-suspenders Esc: a local monitor fires for this app's key events
+    /// regardless of which window is key, so Esc always ends the session.
+    private func installEscFallback() {
+        guard escMonitor == nil else { return }
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.overlayWindow != nil else { return event }
+            if event.keyCode == UInt16(kVK_Escape) {
+                self.teardown()
+                return nil
+            }
+            return event
         }
     }
 
@@ -274,6 +325,9 @@ final class ScreenshotController: NSObject {
     }
 
     private func teardown() {
+        keyRetryWork?.cancel()
+        keyRetryWork = nil
+        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
         toolbar?.removeFromSuperview()
         toolbar = nil
         overlayWindow?.orderOut(nil)

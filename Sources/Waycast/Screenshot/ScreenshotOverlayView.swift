@@ -10,6 +10,10 @@ final class ScreenshotOverlayView: NSView {
     var onDoubleClick: (() -> Void)?
     /// Fires once when a fresh drag produces a valid box (mouse-up).
     var onSelectionSettled: (() -> Void)?
+    /// Right-click anywhere on the overlay cancels the whole session — the
+    /// mouse-driven escape hatch that works even when the window lost key
+    /// focus (e.g. a hotkey fired while the status menu was still open).
+    var onCancelByRightClick: (() -> Void)?
     /// True only while dragging out a BRAND-NEW selection box; the toolbar
     /// hides during that (so it doesn't chase the box) but stays visible for
     /// annotation drags / clicks inside an existing selection.
@@ -160,6 +164,13 @@ final class ScreenshotOverlayView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        // If the window somehow isn't key (menu-tracking race), any click
+        // first re-claims focus so subsequent Esc/⌘Z reach us.
+        if window?.isKeyWindow == false {
+            NSApp.activate(ignoringOtherApps: true)
+            window?.makeKeyAndOrderFront(nil)
+            window?.makeFirstResponder(self)
+        }
         let p = viewPoint(from: event)
 
         if event.clickCount == 2, model.tool == .select,
@@ -318,6 +329,10 @@ final class ScreenshotOverlayView: NSView {
         }
         onSelectionChanged?(model.selection)
         needsDisplay = true
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        onCancelByRightClick?()
     }
 
     override func scrollWheel(with event: NSEvent) {

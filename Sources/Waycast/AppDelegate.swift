@@ -14,6 +14,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var hotkeyManager: HotkeyManager!
     private weak var waterlineItem: NSMenuItem?
+    /// True while the status-bar menu is open. A hotkey pressed during menu
+    /// tracking runs its handler inside (or right after) the menu's nested
+    /// event loop, where the screenshot overlay can't become key — the old
+    /// race that froze the screen behind an undismissable overlay.
+    private var statusMenuTracking = false
+    private var statusMenuClosedAt: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
@@ -71,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.image = Self.defaultStatusImage()
         }
         statusItem.menu = buildStatusMenu()
+        statusItem.menu?.delegate = self
 
         // Memory waterline icon (opt-in): pushes new frames into the button,
         // nil restores the default bolt.
@@ -146,14 +153,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func registerHotkeys() {
         hotkeyManager.unregisterAll()
         hotkeyManager.register(id: .search, config: settings.searchHotkey) {
-            Task { @MainActor in self.searchController.toggle() }
+            Task { @MainActor in
+                guard !self.suspendedByStatusMenu() else { return }
+                self.searchController.toggle()
+            }
         }
         hotkeyManager.register(id: .screenshot, config: settings.screenshotHotkey) {
-            Task { @MainActor in self.screenshotController.start(mode: .annotate) }
+            Task { @MainActor in
+                guard !self.suspendedByStatusMenu() else { return }
+                self.screenshotController.start(mode: .annotate)
+            }
         }
         hotkeyManager.register(id: .pin, config: settings.pinHotkey) {
-            Task { @MainActor in self.screenshotController.start(mode: .pin) }
+            Task { @MainActor in
+                guard !self.suspendedByStatusMenu() else { return }
+                self.screenshotController.start(mode: .pin)
+            }
         }
+    }
+
+    /// Hotkeys are ignored while the status menu is open and for a short
+    /// cooldown after it closes, so a press never launches a UI whose window
+    /// cannot take key focus from the still-tearing-down menu tracking loop.
+    private func suspendedByStatusMenu() -> Bool {
+        if statusMenuTracking { return true }
+        if let t = statusMenuClosedAt, Date().timeIntervalSince(t) < 0.4 { return true }
+        return false
     }
 
     @objc private func showSearch() { searchController.toggle() }
@@ -183,5 +208,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
             NSWorkspace.shared.open(url)
         }
+    }
+}
+
+// MARK: - Status menu tracking
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        statusMenuTracking = true
+        statusMenuClosedAt = nil
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        statusMenuTracking = false
+        statusMenuClosedAt = Date()
     }
 }
