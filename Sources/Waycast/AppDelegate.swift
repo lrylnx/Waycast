@@ -1,4 +1,5 @@
 import Cocoa
+import ApplicationServices
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -14,6 +15,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var hotkeyManager: HotkeyManager!
     private weak var waterlineItem: NSMenuItem?
+    /// Self-heals the AppRing event tap (the system disables it after sleep /
+    /// login, or until Accessibility is granted).
+    private var appRingTapTimer: Timer?
     /// True while the status-bar menu is open. A hotkey pressed during menu
     /// tracking runs its handler inside (or right after) the menu's nested
     /// event loop, where the screenshot overlay can't become key — the old
@@ -34,11 +38,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Warm up the app index and Spotlight so the first invocation is fast.
         searchController.warmUp()
 
+        // AppRing radial switcher (opt-out via settings; default on).
+        startAppRing()
+
         // First-run guidance for required permissions.
         if !CGPreflightScreenCaptureAccess() {
             showScreenCapturePermissionAlert()
         }
     }
+
+    // MARK: - AppRing (radial app switcher)
+
+    /// Bring up the ring switcher and keep its event tap alive. The tap needs
+    /// the Accessibility permission; until it's granted `install()` fails, so a
+    /// light timer retries every couple seconds (also self-heals after sleep).
+    private func startAppRing() {
+        MRUModel.shared.start()
+        RingController.shared.start()
+        if !AXIsProcessTrusted() {
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+            _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+        }
+        appRingTapTimer?.invalidate()
+        appRingTapTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            Task { @MainActor in _ = RingController.shared.ensureTap() }
+        }
+    }
+
+    /// Apply the AppRing master toggle from the settings window: start the tap
+    /// when enabled, tear it down (reverting ⌘Tab to the system) when disabled.
+    func applyAppRingEnabled(_ enabled: Bool) {
+        AppRingSettings.enabled = enabled
+        if enabled {
+            RingController.shared.start()
+        } else {
+            RingController.shared.stop()
+        }
+    }
+
 
     /// Minimal main menu. Accessory apps get no default menu, which is why
     /// ⌘C/⌘A in the OCR text view did nothing — those are menu-driven key

@@ -76,8 +76,61 @@ final class HotkeyRecorder: ObservableObject {
     }
 }
 
+/// Records a new AppRing summon shortcut through the ring's own event tap —
+/// the only way to capture ⌘Tab itself without the system switcher popping.
+/// SAFETY: while recording, the tap swallows EVERY keyDown system-wide, so
+/// the handler is guaranteed to clear via Esc, a 10s timeout, window close,
+/// or deinit.
+@MainActor
+final class AppRingShortcutRecorder: ObservableObject {
+    @Published var isRecording = false
+    private var timeoutWork: DispatchWorkItem?
+    private var closeObserver: NSObjectProtocol?
+
+    func start() {
+        stop()
+        isRecording = true
+        RingController.shared.setShortcutRecorder { [weak self] keyCode, flags in
+            Task { @MainActor in self?.handle(keyCode, flags) }
+        }
+        // Hard timeout: never leave the global tap in recording mode.
+        let work = DispatchWorkItem { [weak self] in self?.stop() }
+        timeoutWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+        // Closing the settings window mid-recording must also restore the tap.
+        closeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.stop() }
+            }
+    }
+
+    func stop() {
+        guard isRecording else { return }
+        isRecording = false
+        timeoutWork?.cancel()
+        timeoutWork = nil
+        if let ob = closeObserver { NotificationCenter.default.removeObserver(ob); closeObserver = nil }
+        RingController.shared.setShortcutRecorder(nil)
+    }
+
+    private func handle(_ keyCode: Int, _ flags: CGEventFlags) {
+        guard isRecording else { return }
+        if keyCode == kVK_Escape { stop(); return }
+        let mods = flags.intersection([.maskControl, .maskAlternate, .maskShift, .maskCommand])
+        // Require a modifier chord, or a bare function key.
+        guard !mods.isEmpty || AppRingSettings.functionKeyCodes.contains(keyCode) else { return }
+        AppRingSettings.summonModifiers = mods
+        AppRingSettings.summonKeyCode = keyCode
+        stop()
+        NSSound.beep()
+    }
+}
+
 struct SettingsView: View {
     @StateObject private var recorder = HotkeyRecorder()
+    @StateObject private var ringRecorder = AppRingShortcutRecorder()
+    @State private var ringEnabled = AppRingSettings.enabled
+    @State private var ringSideButton = AppRingSettings.sideButtonEnabled
     @State private var searchKey = AppSettings.shared.searchHotkey
     @State private var screenshotKey = AppSettings.shared.screenshotHotkey
     @State private var pinKey = AppSettings.shared.pinHotkey
@@ -115,6 +168,48 @@ struct SettingsView: View {
                 hotkeyRow("贴图", display: pinKey.displayString, target: .pin)
             } header: {
                 Text("全局快捷键").font(.headline)
+            }
+
+            Section {
+                Toggle("启用环形应用切换器", isOn: $ringEnabled)
+                    .onChange(of: ringEnabled) { newValue in
+                        AppDelegate.shared.applyAppRingEnabled(newValue)
+                    }
+                HStack {
+                    Text("呼出快捷键")
+                    Spacer()
+                    Button(ringRecorder.isRecording ? "请按下新快捷键…" : AppRingSettings.summonShortcutLabel) {
+                        if ringRecorder.isRecording {
+                            ringRecorder.stop()
+                        } else {
+                            ringRecorder.start()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!ringEnabled)
+                    .frame(minWidth: 130)
+                    if ringRecorder.isRecording {
+                        Button("取消") { ringRecorder.stop() }
+                            .buttonStyle(.borderless)
+                    }
+                    Button("重置") {
+                        ringRecorder.stop()
+                        AppRingSettings.resetSummonShortcut()
+                        ringRecorder.objectWillChange.send()
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!ringEnabled)
+                }
+                Toggle("鼠标侧键呼出", isOn: $ringSideButton)
+                    .onChange(of: ringSideButton) { newValue in
+                        AppRingSettings.sideButtonEnabled = newValue
+                        RingController.shared.sideButtonEnabled = newValue
+                    }
+                    .disabled(!ringEnabled)
+                Text("按住修饰键、点按呼出键唤出圆环，松开即切换到选中的 App；默认 ⌘Tab 直接接管系统切换器。悬停多窗口应用会展开窗口花瓣（需屏幕录制权限显示缩略图）。关闭后 ⌘Tab 恢复系统行为。")
+                    .font(.caption).foregroundColor(.secondary)
+            } header: {
+                Text("环形应用切换 (AppRing)").font(.headline)
             }
 
             Section {
