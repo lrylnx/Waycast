@@ -26,3 +26,5 @@ codesign --force --deep --sign - "${APP_DIR}"
 
 echo "==> done: $(pwd)/${APP_DIR}"
 echo "   首次运行需要授权：系统设置 › 隐私与安全性 › 屏幕录制"
+echo ""
+echo "发布打包请运行 ./package.sh（不要手动在 Finder 里压缩 .app，容易丢掉外层目录）"

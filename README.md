@@ -102,6 +102,13 @@ Waycast 需要以下系统权限，首次启动会自动引导授权：
 
 前往 [Releases](https://github.com/lrylnx/Waycast/releases) 页面下载 `Waycast.zip`，解压后将 `Waycast.app` 拖入「应用程序」文件夹，首次运行按提示授予权限即可。
 
+> **首次打开被系统拦截？** Waycast 使用 ad-hoc 签名、未经 Apple 公证，从浏览器下载后 macOS 会加上隔离属性，双击可能提示「无法打开，因为 Apple 无法验证」。任选其一解决：
+>
+> - 在「应用程序」里**右键点按** Waycast → **打开**，在弹窗中再点一次「打开」；
+> - 或执行一次：`xattr -dr com.apple.quarantine /Applications/Waycast.app`
+>
+> 之后正常双击即可。
+
 ## 系统要求
 
 macOS 14.0 或更高版本。
