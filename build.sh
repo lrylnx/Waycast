@@ -1,5 +1,9 @@
 #!/bin/bash
-# Build Waycast.app from the SPM package and ad-hoc sign it.
+# Build Waycast.app from the SPM package and sign it with the stable local
+# identity ("Waycast Developer"). A fixed signature keeps TCC permissions
+# (screen recording, files & folders) across rebuilds — ad-hoc signing would
+# invalidate them on every update. The identity lives in the login keychain;
+# backup cert: codesign/waycast_codesign.p12 (pass: waycast-local).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -7,6 +11,7 @@ CONFIG="${1:-release}"
 APP_NAME="Waycast"
 BUILD_DIR=".build"
 APP_DIR="build/${APP_NAME}.app"
+SIGN_IDENTITY="${WAYCAST_SIGN_IDENTITY:-Waycast Developer}"
 
 echo "==> swift build -c ${CONFIG}"
 swift build -c "${CONFIG}"
@@ -21,8 +26,9 @@ cp Resources/Info.plist "${APP_DIR}/Contents/Info.plist"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "${APP_DIR}/Contents/PkgInfo"
 
-echo "==> ad-hoc codesign"
-codesign --force --deep --sign - "${APP_DIR}"
+echo "==> codesign (identity: ${SIGN_IDENTITY})"
+xattr -cr "${APP_DIR}" 2>/dev/null || true
+codesign --force --deep --sign "${SIGN_IDENTITY}" "${APP_DIR}"
 
 echo "==> done: $(pwd)/${APP_DIR}"
 echo "   首次运行需要授权：系统设置 › 隐私与安全性 › 屏幕录制"

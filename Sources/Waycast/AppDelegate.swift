@@ -10,8 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Feature controllers
     private(set) lazy var searchController = SpotlightController()
-    private(set) lazy var screenshotController = ScreenshotController()
     private(set) lazy var clipboardController = ClipboardController()
+    private(set) lazy var captureController = CaptureController()
 
     private var hotkeyManager: HotkeyManager!
     private weak var waterlineItem: NSMenuItem?
@@ -38,13 +38,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Warm up the app index and Spotlight so the first invocation is fast.
         searchController.warmUp()
 
+        // Prewarm ScreenCaptureKit so the first frozen capture is fast (Mio-style).
+        Task { await FrozenCapture.prewarm() }
+
+        // Warm the capture overlay panel pool now (invisible windows) so the
+        // first F1 never orders a new window front — macOS 26 zoom-animates
+        // new windows, and a fullscreen overlay opening reads as the whole
+        // screen zooming.
+        _ = captureController
+
         // AppRing radial switcher (opt-out via settings; default on).
         startAppRing()
 
         // First-run guidance for required permissions.
-        if !CGPreflightScreenCaptureAccess() {
-            showScreenCapturePermissionAlert()
-        }
+        checkDocumentsAccess()
     }
 
     // MARK: - AppRing (radial app switcher)
@@ -141,13 +148,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         search.target = self
         menu.addItem(search)
 
-        let shot = NSMenuItem(title: "截图  F1", action: #selector(startScreenshot), keyEquivalent: "")
+        let shot = NSMenuItem(title: "截图  F1", action: #selector(startCapture), keyEquivalent: "")
         shot.target = self
         menu.addItem(shot)
-
-        let pin = NSMenuItem(title: "贴图  F3", action: #selector(startPinCapture), keyEquivalent: "")
-        pin.target = self
-        menu.addItem(pin)
 
         menu.addItem(.separator())
 
@@ -195,16 +198,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.searchController.toggle()
             }
         }
-        hotkeyManager.register(id: .screenshot, config: settings.screenshotHotkey) {
+        hotkeyManager.register(id: .capture, config: settings.captureHotkey) {
             Task { @MainActor in
                 guard !self.suspendedByStatusMenu() else { return }
-                self.screenshotController.start(mode: .annotate)
-            }
-        }
-        hotkeyManager.register(id: .pin, config: settings.pinHotkey) {
-            Task { @MainActor in
-                guard !self.suspendedByStatusMenu() else { return }
-                self.screenshotController.start(mode: .pin)
+                self.captureController.start()
             }
         }
     }
@@ -219,8 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showSearch() { searchController.toggle() }
-    @objc private func startScreenshot() { screenshotController.start(mode: .annotate) }
-    @objc private func startPinCapture() { screenshotController.start(mode: .pin) }
+    @objc private func startCapture() { captureController.start() }
     @objc private func toggleInputLock() { InputSourceLock.shared.toggle() }
     @objc private func toggleWaterline() { MemoryWaterline.shared.toggle() }
 
@@ -233,17 +229,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Permissions
 
-    private func showScreenCapturePermissionAlert() {
-        let alert = NSAlert()
-        alert.messageText = "需要屏幕录制权限"
-        alert.informativeText = "截图功能需要「屏幕录制」权限。\n请在 系统设置 › 隐私与安全性 › 屏幕录制 中勾选 Waycast，然后重新启动应用。"
-        alert.addButton(withTitle: "打开系统设置")
-        alert.addButton(withTitle: "稍后")
-        alert.alertStyle = .warning
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
-            NSWorkspace.shared.open(url)
+    /// Unlike Accessibility / ScreenCapture, the TCC "Documents folder"
+    /// grant has NO proactive-request API: the system only prompts on actual
+    /// file access from a user-initiated context, and silently denies
+    /// background access — which is why file-search results under
+    /// ~/Documents used to vanish with no explanation. Touching the folder
+    /// on the MAIN thread at launch is the only way to raise the one-time
+    /// system prompt; if the grant was already decided (denied or lost to an
+    /// ad-hoc rebuild), the probe fails and we route the user to Settings
+    /// ourselves, mirroring the screen-capture guidance above.
+    private func checkDocumentsAccess() {
+        let docs = NSHomeDirectory() + "/Documents"
+        // This touch may itself raise the one-time TCC prompt.
+        _ = try? FileManager.default.contentsOfDirectory(atPath: docs)
+        // Give a just-shown system prompt a moment to be answered before
+        // concluding the grant is missing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard (try? FileManager.default.contentsOfDirectory(atPath: docs)) == nil else { return }
+            guard self != nil else { return }
+            let alert = NSAlert()
+            alert.messageText = "需要「文稿」文件夹访问权限"
+            alert.informativeText = "文件搜索需要访问「文稿」文件夹。\n请在 系统设置 › 隐私与安全性 › 完全磁盘访问权限 中打开 Waycast（若无开关，先添加 /Applications/Waycast.app），然后重新启动应用。"
+            alert.addButton(withTitle: "打开系统设置")
+            alert.addButton(withTitle: "稍后")
+            alert.alertStyle = .warning
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn {
+                let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+                NSWorkspace.shared.open(url)
+            }
         }
     }
 }

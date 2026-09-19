@@ -6,8 +6,7 @@ import Carbon.HIToolbox
 final class HotkeyManager {
     enum HotkeyID: UInt32 {
         case search = 1
-        case screenshot = 2
-        case pin = 3
+        case capture = 2
     }
 
     private var refs: [HotkeyID: EventHotKeyRef] = [:]
