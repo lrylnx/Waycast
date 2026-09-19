@@ -18,20 +18,15 @@ final class AppSettings {
 
     static let defaultSearch = HotkeyConfig(keyCode: UInt32(kVK_Space),
                                             modifiers: UInt32(cmdKey))
-    static let defaultScreenshot = HotkeyConfig(keyCode: UInt32(kVK_F1), modifiers: 0)
-    static let defaultPin = HotkeyConfig(keyCode: UInt32(kVK_F3), modifiers: 0)
+    static let defaultCapture = HotkeyConfig(keyCode: UInt32(kVK_F1), modifiers: 0)
 
     var searchHotkey: HotkeyConfig {
         get { hotkey(forKey: "searchHotkey", fallback: Self.defaultSearch) }
         set { set(hotkey: newValue, forKey: "searchHotkey") }
     }
-    var screenshotHotkey: HotkeyConfig {
-        get { hotkey(forKey: "screenshotHotkey", fallback: Self.defaultScreenshot) }
-        set { set(hotkey: newValue, forKey: "screenshotHotkey") }
-    }
-    var pinHotkey: HotkeyConfig {
-        get { hotkey(forKey: "pinHotkey", fallback: Self.defaultPin) }
-        set { set(hotkey: newValue, forKey: "pinHotkey") }
+    var captureHotkey: HotkeyConfig {
+        get { hotkey(forKey: "captureHotkey", fallback: Self.defaultCapture) }
+        set { set(hotkey: newValue, forKey: "captureHotkey") }
     }
 
     /// Max clipboard text entries retained.

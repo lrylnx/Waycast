@@ -132,13 +132,12 @@ struct SettingsView: View {
     @State private var ringEnabled = AppRingSettings.enabled
     @State private var ringSideButton = AppRingSettings.sideButtonEnabled
     @State private var searchKey = AppSettings.shared.searchHotkey
-    @State private var screenshotKey = AppSettings.shared.screenshotHotkey
-    @State private var pinKey = AppSettings.shared.pinHotkey
+    @State private var captureKey = AppSettings.shared.captureHotkey
     @State private var clipboardLimit = AppSettings.shared.clipboardLimit
     @State private var autoStart = LaunchAtLogin.isEnabled
     @State private var autoStartError: String?
 
-    enum Target: Hashable { case search, screenshot, pin }
+    enum Target: Hashable { case search, capture }
 
     var body: some View {
         Form {
@@ -164,8 +163,7 @@ struct SettingsView: View {
 
             Section {
                 hotkeyRow("搜索面板", display: searchKey.displayString, target: .search)
-                hotkeyRow("截图", display: screenshotKey.displayString, target: .screenshot)
-                hotkeyRow("贴图", display: pinKey.displayString, target: .pin)
+                hotkeyRow("截图", display: captureKey.displayString, target: .capture)
             } header: {
                 Text("全局快捷键").font(.headline)
             }
@@ -228,7 +226,7 @@ struct SettingsView: View {
             .onChange(of: clipboardLimit) { AppSettings.shared.clipboardLimit = $0 }
 
             Section {
-                Text("截图：拖拽选择区域，双击或点「完成」复制到剪贴板；工具栏支持矩形、画笔、文字、箭头、马赛克、OCR、撤销、保存、贴图；选中工具后滚动滚轮调节粗细/字号。")
+                Text("截图（Mio 冻结帧方案）：按 F1 后所有屏幕先定格成静帧，拖拽框选区域后点「复制 / OCR / 保存」；悬停时窗口会高亮，直接单击窗口即整窗截图（自带透明圆角），Shift+单击窗口则识别窗口内文字。Esc 或右键取消。")
                     .font(.caption).foregroundColor(.secondary)
                 Text("搜索：结果列表中的文件可直接拖拽到访达、邮件、聊天窗口等任意位置。")
                     .font(.caption).foregroundColor(.secondary)
@@ -263,8 +261,7 @@ struct SettingsView: View {
         let settings = AppSettings.shared
         switch target {
         case .search: settings.searchHotkey = value; searchKey = value
-        case .screenshot: settings.screenshotHotkey = value; screenshotKey = value
-        case .pin: settings.pinHotkey = value; pinKey = value
+        case .capture: settings.captureHotkey = value; captureKey = value
         }
         AppDelegate.shared.registerHotkeys()
     }

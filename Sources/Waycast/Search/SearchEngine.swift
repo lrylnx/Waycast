@@ -108,12 +108,30 @@ final class SearchEngine {
             // kMDQuerySyncExecution = 1: blocks this queue until gathering is
             // done; MDQueryStop() from another thread aborts it early.
             _ = MDQueryExecute(md, CFOptionFlags(1))
-            let items = self.collect(md, limit: 40)
+            let (items, droppedInDocuments) = self.collect(md, limit: 40)
             self.clearCurrentIf(md)
             DispatchQueue.main.async {
-                if self.isCurrent(generation) { onFiles(items) }
+                guard self.isCurrent(generation) else { return }
+                // Spotlight returned paths but we couldn't stat them — almost
+                // always a missing TCC grant for ~/Documents. The system never
+                // re-prompts for that (see class docs), so surface it once.
+                if items.isEmpty && droppedInDocuments > 0 {
+                    MainActor.assumeIsolated {
+                        self.warnDocumentsPermissionIfNeeded()
+                    }
+                }
+                onFiles(items)
             }
         }
+    }
+
+    /// One-shot hint when Spotlight found files under ~/Documents that we
+    /// could not access (TCC "Documents folder" / Full Disk Access missing).
+    @MainActor private static var didWarnDocumentsPermission = false
+    @MainActor private func warnDocumentsPermissionIfNeeded() {
+        guard !Self.didWarnDocumentsPermission else { return }
+        Self.didWarnDocumentsPermission = true
+        Toast.show("无法访问「文稿」文件夹：请在 系统设置 → 隐私与安全性 → 完全磁盘访问权限 中允许 Waycast")
     }
 
     // MARK: - App ranking (fuzzy)
@@ -163,16 +181,24 @@ final class SearchEngine {
     /// dispatch queue is attached, so nothing mutates the result list while
     /// we iterate. Extract plain strings immediately and never let the MDItem
     /// references escape this function.
-    private func collect(_ md: MDQuery, limit: Int) -> [SearchItem] {
+    /// Returns the converted items plus the number of Spotlight results that
+    /// had to be dropped because fileExists failed — when those paths are all
+    /// under ~/Documents, that is the signature of a missing TCC grant.
+    private func collect(_ md: MDQuery, limit: Int) -> (items: [SearchItem], droppedInDocuments: Int) {
         let count = MDQueryGetResultCount(md)
         var items: [SearchItem] = []
         items.reserveCapacity(min(Int(count), limit))
+        var droppedInDocuments = 0
+        let home = NSHomeDirectory()
         for i in 0..<min(count, CFIndex(limit)) {
             guard let raw = MDQueryGetResultAtIndex(md, i) else { continue }
             let item = Unmanaged<MDItem>.fromOpaque(raw).takeUnretainedValue()
             guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String else { continue }
             var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { continue }
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else {
+                if path.hasPrefix(home + "/Documents") { droppedInDocuments += 1 }
+                continue
+            }
             let name = (path as NSString).lastPathComponent
             var kind: SearchItem.Kind = isDir.boolValue ? .folder : .file
             if !isDir.boolValue {
@@ -187,7 +213,7 @@ final class SearchEngine {
                                     subtitle: dirAbbrev((path as NSString).deletingLastPathComponent),
                                     url: URL(fileURLWithPath: path)))
         }
-        return items
+        return (items, droppedInDocuments)
     }
 
     private func dirAbbrev(_ dir: String) -> String {
