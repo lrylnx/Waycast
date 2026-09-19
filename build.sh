@@ -14,9 +14,12 @@ APP_DIR="build/${APP_NAME}.app"
 SIGN_IDENTITY="${WAYCAST_SIGN_IDENTITY:-Waycast Developer}"
 
 echo "==> swift build -c ${CONFIG}"
-swift build -c "${CONFIG}"
+# --disable-sandbox: inside restricted environments swift-build's own
+# sandbox-exec fails with "Operation not permitted"; the outer build
+# environment already provides isolation.
+swift build -c "${CONFIG}" --disable-sandbox
 
-BIN=$(swift build -c "${CONFIG}" --show-bin-path)/${APP_NAME}
+BIN=$(swift build -c "${CONFIG}" --show-bin-path --disable-sandbox)/${APP_NAME}
 
 echo "==> assembling ${APP_DIR}"
 rm -rf "${APP_DIR}"

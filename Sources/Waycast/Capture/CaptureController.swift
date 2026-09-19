@@ -369,12 +369,34 @@ final class CaptureSelectionView: NSView {
         let dragged = max(abs(end.x - start.x), abs(end.y - start.y)) > Self.clickThreshold
 
         if !dragged {
-            // Plain click: take the hovered window as-is (transparent corners).
+            // Plain click: take the hovered window — but instead of shipping
+            // it straight to the clipboard, select its region so the user can
+            // annotate / reposition / choose 复制·保存·OCR like a drag pick.
             phase = .idle
             if let hit = WindowHitTester.hitTestAtMouse() {
                 hoverHighlight = nil
+                // Shift+click keeps the shortcut: capture the window and run
+                // OCR immediately.
+                if event.modifierFlags.contains(.shift) {
+                    needsDisplay = true
+                    onWindowClicked?(hit, true)
+                    return
+                }
+                if let screenWindow = window {
+                    let local = convert(screenWindow.convertFromScreen(hit.bounds), from: nil)
+                    let rect = local.intersection(bounds)
+                    if rect.width > Self.minSelectionSize, rect.height > Self.minSelectionSize {
+                        selectionRect = rect
+                        phase = .pendingAction
+                        needsDisplay = true
+                        showActionBar(below: rect)
+                        return
+                    }
+                }
+                // Window lives on another display (no local geometry here):
+                // fall back to direct window capture → clipboard.
                 needsDisplay = true
-                onWindowClicked?(hit, event.modifierFlags.contains(.shift))
+                onWindowClicked?(hit, false)
                 return
             }
             needsDisplay = true
@@ -484,9 +506,14 @@ final class CaptureSelectionView: NSView {
               let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
                                          isPlanar: false, colorSpaceName: .calibratedRGB,
-                                         bytesPerRow: 0, bitsPerPixel: 0),
-              let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        // MUST be set BEFORE creating the graphics context: the context bakes
+        // its point→pixel scale from the rep's size at creation time. Setting
+        // it afterwards leaves the context in raw pixel units, so the base
+        // frame was composited at half scale into the bitmap's lower-left
+        // corner (everything else transparent/black).
         rep.size = NSSize(width: rect.width, height: rect.height)
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
 
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = context
@@ -1088,6 +1115,9 @@ final class CaptureController: NSObject {
         }
     }
 
+    /// Legacy direct-capture path, now only used for Shift+click OCR and as
+    /// the cross-display fallback (plain click enters editing mode instead —
+    /// see CaptureSelectionView.mouseUp).
     private func windowClicked(hit: WindowHitTestResult, ocr: Bool) {
         let windowID = hit.windowID
         let ownerPID = hit.ownerPID
