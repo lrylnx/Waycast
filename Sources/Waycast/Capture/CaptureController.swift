@@ -94,10 +94,17 @@ struct ArrowAnnotation {
     var width: CGFloat
 }
 
+struct RoundedRectAnnotation {
+    var rect: NSRect
+    var color: NSColor
+    var width: CGFloat
+}
+
 enum CaptureAnnotation {
     case stroke(PenStroke)
     case text(TextAnnotation)
     case arrow(ArrowAnnotation)
+    case roundedRect(RoundedRectAnnotation)
 }
 
 // MARK: - Non-activating overlay panel
@@ -167,10 +174,11 @@ final class AnnotationTextView: NSTextView {
 @MainActor
 final class CaptureSelectionView: NSView {
     enum Phase { case idle, dragging, pendingAction }
-    enum Tool { case none, pen, text, arrow }
+    enum Tool { case none, pen, text, arrow, roundedRect }
 
     static let clickThreshold: CGFloat = 10
     static let minSelectionSize: CGFloat = 10
+    static let handleTolerance: CGFloat = 6
     static let penWidth: CGFloat = 4
     static let textFontSize: CGFloat = 18
     static let palette: [NSColor] = [.systemRed, .systemYellow, .systemGreen, .systemBlue, .black]
@@ -189,12 +197,24 @@ final class CaptureSelectionView: NSView {
     private var annotations: [CaptureAnnotation] = []
     private var currentStroke: PenStroke?
     private var currentArrow: ArrowAnnotation?
+    private var currentRoundedRect: RoundedRectAnnotation?
+    private var roundedRectStart: NSPoint?
 
     // Selection-move state (drag the rect with no tool active).
     private var moveOrigin: NSPoint?
     private var preMoveRect: NSRect?
     private var preMoveAnnotations: [CaptureAnnotation] = []
     private var textEditor: AnnotationTextView?
+
+    // Selection-resize state (drag a corner/edge of the rect).
+    private struct ResizeEdges: OptionSet {
+        let rawValue: UInt8
+        static let minX = ResizeEdges(rawValue: 1 << 0)
+        static let maxX = ResizeEdges(rawValue: 1 << 1)
+        static let minY = ResizeEdges(rawValue: 1 << 2)
+        static let maxY = ResizeEdges(rawValue: 1 << 3)
+    }
+    private var resizeState: (edges: ResizeEdges, original: NSRect)?
 
     private var startPoint: NSPoint?
     private var endPoint: NSPoint?
@@ -247,6 +267,11 @@ final class CaptureSelectionView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        // Cursor feedback over the selection border in editing mode.
+        if phase == .pendingAction, tool == .none, let rect = selectionRect {
+            applyCursor(for: resizeEdges(at: convert(event.locationInWindow, from: nil), in: rect))
+            return
+        }
         guard phase == .idle else { return }
         let previous = hoverHighlight
         hoverHighlight = resolveWindowHighlight()
@@ -258,6 +283,13 @@ final class CaptureSelectionView: NSView {
 
         if phase == .pendingAction, let rect = selectionRect {
             commitTextEditor()
+            // Grab a resize handle first: corners/edges win over "inside → move"
+            // and "outside → new selection", so the border is always resizable.
+            if tool == .none, let edges = resizeEdges(at: point, in: rect) {
+                resizeState = (edges, rect)
+                applyCursor(for: edges)
+                return
+            }
             if rect.contains(point) {
                 switch tool {
                 case .pen:
@@ -268,6 +300,13 @@ final class CaptureSelectionView: NSView {
                     currentArrow = ArrowAnnotation(start: clamped(point, in: rect),
                                                    end: clamped(point, in: rect),
                                                    color: annotationColor, width: Self.penWidth)
+                    needsDisplay = true
+                case .roundedRect:
+                    let p = clamped(point, in: rect)
+                    roundedRectStart = p
+                    currentRoundedRect = RoundedRectAnnotation(rect: NSRect(origin: p, size: .zero),
+                                                               color: annotationColor,
+                                                               width: Self.penWidth)
                     needsDisplay = true
                 case .text:
                     beginTextEditor(at: point, in: rect)
@@ -298,6 +337,15 @@ final class CaptureSelectionView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+
+        // Resizing via a grabbed corner/edge.
+        if let state = resizeState, phase == .pendingAction {
+            let newRect = resizedRect(state.original, edges: state.edges, to: point)
+            selectionRect = newRect
+            moveActionBar(below: newRect)
+            needsDisplay = true
+            return
+        }
 
         // Moving the whole selection.
         if let origin = moveOrigin, let original = preMoveRect, phase == .pendingAction {
@@ -330,6 +378,16 @@ final class CaptureSelectionView: NSView {
             return
         }
 
+        // Rounded rect in progress: drag defines the box.
+        if currentRoundedRect != nil, phase == .pendingAction,
+           let rect = selectionRect, let start = roundedRectStart {
+            let p = clamped(point, in: rect)
+            currentRoundedRect?.rect = NSRect(x: min(start.x, p.x), y: min(start.y, p.y),
+                                              width: abs(p.x - start.x), height: abs(p.y - start.y))
+            needsDisplay = true
+            return
+        }
+
         guard phase == .dragging, let start = startPoint else { return }
         endPoint = point
         let dragged = max(abs(endPoint!.x - start.x), abs(endPoint!.y - start.y)) > Self.clickThreshold
@@ -339,6 +397,15 @@ final class CaptureSelectionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        // Finish a resize drag.
+        if resizeState != nil {
+            resizeState = nil
+            if let rect = selectionRect { moveActionBar(below: rect) }
+            NSCursor.arrow.set()
+            needsDisplay = true
+            return
+        }
+
         // Finish selection move.
         if moveOrigin != nil {
             moveOrigin = nil
@@ -361,6 +428,18 @@ final class CaptureSelectionView: NSView {
             annotations.append(.arrow(arrow))
             currentArrow = nil
             refreshUndoState()
+            needsDisplay = true
+            return
+        }
+
+        // Finish rounded rect (ignore zero-size click without drag).
+        if let rr = currentRoundedRect {
+            currentRoundedRect = nil
+            roundedRectStart = nil
+            if rr.rect.width > 2, rr.rect.height > 2 {
+                annotations.append(.roundedRect(rr))
+                refreshUndoState()
+            }
             needsDisplay = true
             return
         }
@@ -633,14 +712,16 @@ final class CaptureSelectionView: NSView {
         stack.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
 
         // Tools
-        let pen = Self.makeIconButton("scribble.variable", "画笔") { [weak self] in self?.setTool(.pen) }
+        let pen = Self.makeIconButton("pencil", "画笔") { [weak self] in self?.setTool(.pen) }
+        let roundedRect = Self.makeIconButton("squareshape", "圆角矩形") { [weak self] in self?.setTool(.roundedRect) }
         let arrow = Self.makeIconButton("arrow.up.right", "箭头") { [weak self] in self?.setTool(.arrow) }
         let text = Self.makeLetterIconButton("T", "文字") { [weak self] in self?.setTool(.text) }
         let undo = Self.makeIconButton("arrow.uturn.backward", "撤销") { [weak self] in self?.undoLastAnnotation() }
         undo.isEnabled = false
-        toolButtons = [.pen: pen, .arrow: arrow, .text: text]
+        toolButtons = [.pen: pen, .roundedRect: roundedRect, .arrow: arrow, .text: text]
         undoButton = undo
         stack.addArrangedSubview(pen)
+        stack.addArrangedSubview(roundedRect)
         stack.addArrangedSubview(arrow)
         stack.addArrangedSubview(text)
         stack.addArrangedSubview(undo)
@@ -674,6 +755,9 @@ final class CaptureSelectionView: NSView {
         stack.setCustomSpacing(7, after: actionsSeparator)
 
         // Cancel + final actions (order: 复制 last, 保存 second-to-last)
+        stack.addArrangedSubview(Self.makeIconButton("pin", "钉在桌面") { [weak self] in
+            self?.onFinalAction?("pin")
+        })
         stack.addArrangedSubview(Self.makeIconButton("xmark", "取消", tint: .systemRed) { [weak self] in
             self?.onCancel?()
         })
@@ -845,12 +929,18 @@ final class CaptureSelectionView: NSView {
         NSColor.systemBlue.setStroke()
         path.stroke()
 
+        // Corner knobs: only while the border is resizable (no tool active).
+        if phase == .pendingAction, tool == .none {
+            drawResizeHandles(for: hole)
+        }
+
         // Annotations (also draw the in-progress stroke live).
         context.saveGState()
         context.clip(to: hole)
         drawAnnotations()
         if let stroke = currentStroke { drawStroke(stroke) }
         if let arrow = currentArrow { drawArrow(arrow) }
+        if let rr = currentRoundedRect { drawRoundedRect(rr) }
         context.restoreGState()
     }
 
@@ -860,8 +950,19 @@ final class CaptureSelectionView: NSView {
             case .stroke(let stroke): drawStroke(stroke)
             case .text(let text): drawText(text)
             case .arrow(let arrow): drawArrow(arrow)
+            case .roundedRect(let rr): drawRoundedRect(rr)
             }
         }
+    }
+
+    private func drawRoundedRect(_ rr: RoundedRectAnnotation) {
+        guard rr.rect.width > 1, rr.rect.height > 1 else { return }
+        let radius = min(10, rr.rect.width / 2, rr.rect.height / 2)
+        let path = NSBezierPath(roundedRect: rr.rect, xRadius: radius, yRadius: radius)
+        path.lineWidth = rr.width
+        path.lineJoinStyle = .round
+        rr.color.setStroke()
+        path.stroke()
     }
 
     /// Shifts every annotation by `d` while the selection is being dragged.
@@ -878,6 +979,9 @@ final class CaptureSelectionView: NSView {
                 arrow.start = NSPoint(x: arrow.start.x + d.x, y: arrow.start.y + d.y)
                 arrow.end = NSPoint(x: arrow.end.x + d.x, y: arrow.end.y + d.y)
                 return .arrow(arrow)
+            case .roundedRect(var rr):
+                rr.rect = rr.rect.offsetBy(dx: d.x, dy: d.y)
+                return .roundedRect(rr)
             }
         }
     }
@@ -950,6 +1054,76 @@ final class CaptureSelectionView: NSView {
     }
 
     // MARK: Private
+
+    // MARK: Resize handles
+
+    /// Which rect edges (if any) sit within `handleTolerance` of the point.
+    /// Edges are hit even slightly OUTSIDE the rect, so all four corners are
+    /// grabbable from any direction.
+    private func resizeEdges(at point: NSPoint, in rect: NSRect) -> ResizeEdges? {
+        let tol = Self.handleTolerance
+        var edges: ResizeEdges = []
+        if abs(point.x - rect.minX) <= tol { edges.insert(.minX) }
+        else if abs(point.x - rect.maxX) <= tol { edges.insert(.maxX) }
+        if abs(point.y - rect.minY) <= tol { edges.insert(.minY) }
+        else if abs(point.y - rect.maxY) <= tol { edges.insert(.maxY) }
+        return edges.isEmpty ? nil : edges
+    }
+
+    /// Re-anchors the grabbed edges of `original` to `point`, keeping the rect
+    /// at least `minSelectionSize` on each axis and inside the view bounds.
+    private func resizedRect(_ original: NSRect, edges: ResizeEdges, to point: NSPoint) -> NSRect {
+        var r = original
+        let minSize = Self.minSelectionSize
+        if edges.contains(.minX) {
+            r.origin.x = min(max(point.x, bounds.minX), original.maxX - minSize)
+            r.size.width = original.maxX - r.origin.x
+        } else if edges.contains(.maxX) {
+            let maxX = max(min(point.x, bounds.maxX), original.minX + minSize)
+            r.size.width = maxX - r.origin.x
+        }
+        if edges.contains(.minY) {
+            r.origin.y = min(max(point.y, bounds.minY), original.maxY - minSize)
+            r.size.height = original.maxY - r.origin.y
+        } else if edges.contains(.maxY) {
+            let maxY = max(min(point.y, bounds.maxY), original.minY + minSize)
+            r.size.height = maxY - r.origin.y
+        }
+        return r.intersection(bounds)
+    }
+
+    /// Directional cursor for a handle zone; corner zones use the crosshair
+    /// (AppKit has no public diagonal resize cursors).
+    private func applyCursor(for edges: ResizeEdges?) {
+        guard let edges else { NSCursor.arrow.set(); return }
+        let vertical = edges.contains(.minY) || edges.contains(.maxY)
+        let horizontal = edges.contains(.minX) || edges.contains(.maxX)
+        if vertical && horizontal {
+            NSCursor.crosshair.set()
+        } else if horizontal {
+            NSCursor.resizeLeftRight.set()
+        } else {
+            NSCursor.resizeUpDown.set()
+        }
+    }
+
+    /// Corner knobs on the selection border (drawn when no tool is active).
+    private func drawResizeHandles(for rect: NSRect) {
+        let size: CGFloat = 8
+        let corners = [
+            NSPoint(x: rect.minX, y: rect.minY), NSPoint(x: rect.maxX, y: rect.minY),
+            NSPoint(x: rect.minX, y: rect.maxY), NSPoint(x: rect.maxX, y: rect.maxY),
+        ]
+        for p in corners {
+            let r = NSRect(x: p.x - size / 2, y: p.y - size / 2, width: size, height: size)
+            NSColor.white.setFill()
+            NSBezierPath(rect: r).fill()
+            NSColor.systemBlue.setStroke()
+            let outline = NSBezierPath(rect: r)
+            outline.lineWidth = 1.5
+            outline.stroke()
+        }
+    }
 
     private func clamped(_ point: NSPoint, in rect: NSRect) -> NSPoint {
         NSPoint(x: min(max(point.x, rect.minX), rect.maxX),
@@ -1090,6 +1264,11 @@ final class CaptureController: NSObject {
     private func finalAction(_ action: String, from view: CaptureSelectionView) {
         let anchorFrame = view.window?.frame ?? .zero
         let image = view.composeFinalImage()
+        // Grab the selection's global position BEFORE teardown for pinning.
+        var pinRect: NSRect?
+        if action == "pin", let rect = view.selectionRect, let win = view.window {
+            pinRect = win.convertToScreen(view.convert(rect, to: nil))
+        }
         teardown()
         guard let image else {
             Toast.show("截图失败")
@@ -1098,6 +1277,9 @@ final class CaptureController: NSObject {
         switch action {
         case "copy":
             Self.copyImage(image)
+        case "pin":
+            guard let pinRect else { return }
+            PinnedShotController.shared.pin(image: image, screenRect: pinRect)
         case "ocr":
             Task { @MainActor in
                 let text = await Self.recognizeText(in: image)
@@ -1178,7 +1360,8 @@ final class CaptureController: NSObject {
     }
 
     /// Vision OCR (Chinese + English), background queue, main-thread result.
-    private static func recognizeText(in image: CGImage) async -> String {
+    /// Internal: also used by the pinned-shot window's OCR button.
+    static func recognizeText(in image: CGImage) async -> String {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let request = VNRecognizeTextRequest()
