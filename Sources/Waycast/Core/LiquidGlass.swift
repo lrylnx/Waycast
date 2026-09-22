@@ -76,3 +76,102 @@ enum GlassBackdrop {
         view.layer?.shadowOffset = NSSize(width: 0, height: offset)
     }
 }
+
+// MARK: - SwiftUI 侧
+
+#if canImport(SwiftUI)
+import SwiftUI
+
+/// SwiftUI 版的液态玻璃面板底。
+///
+/// AppKit 侧用 `GlassBackdrop.wrap(_:cornerRadius:)`（自己建 NSGlassEffectView 当容器）；
+/// SwiftUI 侧则用系统给的 `.glassEffect(_:in:)` modifier —— 底层同样是
+/// NSGlassEffectView，但它能正常参与 SwiftUI 的布局、动画与圆角裁剪，
+/// 不需要套一层 NSViewRepresentable（那样要么尺寸对不上，要么状态被隔离）。
+///
+/// 玻璃采样的是**面板背后的内容**。搜索面板本身是 `isOpaque = false` 的
+/// 透明 NSPanel，所以能透出并折射它下面的桌面 / 其他窗口 —— 正是要的效果。
+///
+/// 变体用 `WAYCAST_GLASS_VARIANT` 切换，默认 `regular`（定稿值）：
+///   defaults write com.waycast.macos WAYCAST_GLASS_VARIANT -string clear
+struct PanelGlassBackground: ViewModifier {
+    var cornerRadius: CGFloat = 18
+
+    /// regular = 系统默认（强模糊+提亮，可读性最好）—— **定稿值**
+    /// clear   = 通透（几乎不模糊，背后文字会与列表文字混叠，可读性受损）
+    /// mix     = clear 玻璃 + ultraThinMaterial 垫层
+    ///
+    /// 实测结论：`regular` 观感与可读性最好（2026-09-23 真机 A/B）。
+    /// 另外两种只作为 `WAYCAST_GLASS_VARIANT` 的调试选项保留。
+    private var variant: String {
+        UserDefaults.standard.string(forKey: "WAYCAST_GLASS_VARIANT") ?? "regular"
+    }
+
+    func body(content: Content) -> some View {
+        if PanelShadowMode.current.drawsOwnShadow {
+            glassLayer(content)
+                .background { ownShadow }
+        } else {
+            glassLayer(content)
+        }
+    }
+
+    @ViewBuilder
+    private func glassLayer(_ content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if #available(macOS 26.0, *) {
+            switch variant {
+            case "clear":
+                content.glassEffect(.clear, in: shape)
+            case "mix":
+                // clear 玻璃 + ultraThinMaterial 垫层
+                content
+                    .background(shape.fill(.ultraThinMaterial))
+                    .glassEffect(.clear, in: shape)
+            default:
+                content.glassEffect(.regular, in: shape)
+            }
+        } else {
+            // 旧系统没有 NSGlassEffectView，退回毛玻璃材质 + 高光描边。
+            content
+                .background(shape.fill(.ultraThinMaterial))
+                .clipShape(shape)
+                .overlay(shape.strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+        }
+    }
+
+    /// 自绘圆角阴影。
+    ///
+    /// 系统窗口阴影（`hasShadow = true`）是按「窗口 frame」生成的，而窗口是矩形 ——
+    /// 阴影四角必然是**直角**，在圆角玻璃的下方会尖出两个角，与 UI 不贴合。
+    /// 这里改成自己画：基准形状取**和玻璃完全相同的圆角矩形**，再用 `blur` 向外柔化扩散，
+    /// 于是阴影的轮廓与玻璃圆角一致。画在玻璃**后面**（`.background`）。
+    ///
+    /// 对外扩散的距离由 `PanelShadowMode.shadowSpread` 描述，窗口留白必须 ≥ 它，
+    /// 否则阴影会被窗口边界**硬裁**成一条明显的横线（阴影还没衰减完就断了）。
+    ///
+    /// 实测（2026-09-23，纯白背景 + 逐行亮度剖面）：
+    ///
+    /// | 留白 | blur | 阴影跨度 | 窗口边界前 3px 的亮度跳变 |
+    /// |---|---|---|---|
+    /// | 22pt | 9 | 22pt | **+0.038 → 可见硬边** |
+    /// | 38pt | 9 | 35.5pt | +0.004 → 平缓 |
+    /// | 44pt | 12 | 36pt | +0.004 → 平缓（定稿） |
+    ///
+    /// 结论：`blur(radius: r)` 的可见扩散约 **2.5–3 × r**，留白必须 ≥ 这个值。
+    /// 定稿 44pt 留白配 `r = 12`，四周（含顶部与左右）都留够了余量。
+    private var ownShadow: some View {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            .fill(Color.black.opacity(0.40))
+            .blur(radius: 12)
+            .offset(y: 7)
+    }
+}
+
+extension View {
+    /// 给面板套上 macOS 26 的液态玻璃底；旧系统自动退回毛玻璃材质。
+    func glassPanel(cornerRadius: CGFloat = 18) -> some View {
+        modifier(PanelGlassBackground(cornerRadius: cornerRadius))
+    }
+}
+#endif

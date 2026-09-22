@@ -24,7 +24,18 @@ final class PointerActivity {
 enum SearchPanelLayout {
     static let width: CGFloat = 720
     static let barHeight: CGFloat = 64
-    static let padding: CGFloat = 12
+    /// 玻璃到窗口边缘的透明留白。
+    ///
+    /// 由 `PanelShadowMode` 决定，**不要写死**：
+    /// - `soft`（默认，自绘圆角阴影）：需要留白给阴影向外扩散，否则阴影会被窗口边界裁掉。
+    /// - `system` / `none`：必须为 **0**。
+    ///
+    /// 为什么 system 下必须为 0（实测，2026-09-23，纯白背景 + 像素剖面）：系统窗口阴影的
+    /// 最暗处永远落在**窗口边缘**。只要留了空隙，那条最暗线就会被「晾」在玻璃外侧 ——
+    /// 视觉上就是面板下方多出一条多余的黑线。底缘剖面呈 0.702 → 0.64 → **0.506** → 0.65
+    /// 这种「先暗后亮」的非单调形态；归零后才是 0.600 → 0.741 → 0.820 的单调衰减。
+    /// 留白还会把玻璃自带的柔影晾成一条均匀浅灰带（实测亮度 0.922）。
+    static var padding: CGFloat { PanelShadowMode.current.outerPadding }
     /// Height of the visible card (search bar + optional dropdown).
     static func contentHeight(listHeight: CGFloat) -> CGFloat {
         barHeight + (listHeight > 0 ? 1 /*divider*/ + listHeight : 0)
@@ -53,15 +64,9 @@ struct SearchPanelView: View {
         .frame(width: SearchPanelLayout.width,
                height: SearchPanelLayout.contentHeight(listHeight: viewModel.listHeight),
                alignment: .top)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(.ultraThinMaterial)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
-        )
+        // macOS 26+ 走原生液态玻璃（能折射模糊背后的桌面/窗口）；
+        // 旧系统退回 .ultraThinMaterial + 描边。见 Core/LiquidGlass.swift。
+        .glassPanel(cornerRadius: 18)
         .padding(SearchPanelLayout.padding)
         .frame(width: SearchPanelLayout.width + SearchPanelLayout.padding * 2,
                height: SearchPanelLayout.panelHeight(listHeight: viewModel.listHeight),

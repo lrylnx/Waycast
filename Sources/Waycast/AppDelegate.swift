@@ -66,6 +66,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.captureController.start()
             }
         }
+
+        // 开发者钩子：启动即打开搜索面板（验证面板 UI / 材质用，与上面的
+        // WAYCAST_AUTO_CAPTURE 对称）。
+        //   defaults write com.waycast.macos WAYCAST_AUTO_SEARCH -bool true
+        // 可选再填一个查询词，面板会展开成「有结果」的样子（玻璃面积变大，
+        // 是另一套视觉状态）：
+        //   defaults write com.waycast.macos WAYCAST_AUTO_QUERY -string "切换"
+        if UserDefaults.standard.bool(forKey: "WAYCAST_AUTO_SEARCH") {
+            let delay = UserDefaults.standard.double(forKey: "WAYCAST_AUTO_SEARCH_DELAY")
+            DispatchQueue.main.asyncAfter(deadline: .now() + (delay > 0 ? delay : 1.5)) { [weak self] in
+                guard let self else { return }
+                self.searchController.show()
+                let query = UserDefaults.standard.string(forKey: "WAYCAST_AUTO_QUERY") ?? ""
+                if !query.isEmpty {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        self.searchController.debugSetQuery(query)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - AppRing (radial app switcher)

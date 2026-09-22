@@ -64,6 +64,8 @@ defaults write com.waycast.macos captureDimOpacity -float 0.6   # 0…1，0 = �
 
 低于 macOS 26 时由 `Sources/Waycast/Core/LiquidGlass.swift` 的 `GlassBackdrop` 统一退回「96% 不透明底色 + 1px 高光描边 + 投影」，观感接近但不折射。**新加浮动工具条请一并走 `GlassBackdrop.wrap(_:cornerRadius:)`**，别各自设 `layer.backgroundColor`，否则新老系统会各写一套样式。
 
+**SwiftUI 侧的玻璃**走同一个文件里的 `.glassPanel(cornerRadius:)` —— 底层同样是 `NSGlassEffectView`，但用的是系统给 SwiftUI 的 `.glassEffect(_:in:)` modifier，能正常参与 SwiftUI 的布局 / 动画 / 圆角裁剪，不必套一层 `NSViewRepresentable`（那样要么尺寸对不上，要么状态被隔离）。
+
 > 玻璃只能折射它**下面**的画面。截图覆盖层是同一个窗口里先铺冻结帧+遮罩、再叠工具栏，所以玻璃透出的是「已经被遮罩压暗的」内容，视觉上正好是一块浮在暗幕上的玻璃，层次是对的。
 
 ### 调试钩子
@@ -75,9 +77,14 @@ defaults write com.waycast.macos WAYCAST_AUTO_CAPTURE_DELAY -float 2.5   # 默�
 
 # 不碰任何截图 API，直接给合成纯色帧（隔离 UI 问题时用）
 defaults write com.waycast.macos WAYCAST_NO_CAPTURE -bool true
+
+# 启动即打开搜索面板（验证面板 UI / 材质用）
+defaults write com.waycast.macos WAYCAST_AUTO_SEARCH -bool true
+defaults write com.waycast.macos WAYCAST_AUTO_SEARCH_DELAY -float 2.0   # 默认 1.5 秒
+defaults write com.waycast.macos WAYCAST_AUTO_QUERY -string "切换"       # 选填：自动填入并展开结果
 ```
 
-两个都**用完就删**（`defaults delete com.waycast.macos WAYCAST_AUTO_CAPTURE`），否则每次开 App 都会自动弹截图。走 `defaults` 而不是环境变量是有意的：从终端直接跑可执行文件会把「屏幕录制」权限算到终端头上，截图会失败。
+这些都**用完就删**（`defaults delete com.waycast.macos WAYCAST_AUTO_CAPTURE`），否则每次开 App 都会自动弹。走 `defaults` 而不是环境变量是有意的：从终端直接跑可执行文件会把「屏幕录制」权限算到终端头上，截图会失败。
 
 ## 3. 贴图 (Pin)
 
@@ -91,6 +98,27 @@ defaults write com.waycast.macos WAYCAST_NO_CAPTURE -bool true
 - 结果列表中的文件可**直接拖拽**到访达、邮件、聊天窗口等任意位置
 - 点击面板外部一律关闭；支持中文输入法合成期间的回车提交
 - 搜索面板位置按显示器记忆
+- 面板底是 **macOS 26 液态玻璃**（`.glassEffect`），默认 `regular`。
+  - `regular`（系统默认）：模糊 + 提亮最强，可读性最好 —— **定稿值**
+  - `clear`：几乎不模糊，背景**锐利穿透**，列表文字会和背后内容混在一起
+  - `mix`：`clear` 玻璃 + 一层 `.ultraThinMaterial` 垫层，通透与柔化的折中
+  - 后两种仅作调试保留：`defaults write com.waycast.macos WAYCAST_GLASS_VARIANT -string regular|clear|mix`
+- 面板的投影是**玻璃层自绘的圆角阴影**（`PanelShadowMode.soft`，默认）。
+  - 为什么不用系统窗口阴影：`hasShadow` 生成的阴影按**窗口 frame**（矩形）计算，四角必然是**直角**，
+    在圆角玻璃下方会尖出两个角，不贴合 UI。自绘阴影取「与玻璃完全相同的圆角矩形」再 `blur` 向外扩散，
+    轮廓跟着玻璃圆角走。左右下角实拍对比：`build/search-panel-shadow-round-bl.png`
+  - 代价：自绘阴影要向外扩散，窗口必须留一圈透明留白（`SearchPanelLayout.padding = PanelShadowMode.outerPadding`，**44pt**），
+    否则阴影会被窗口边界**硬裁** —— 阴影还没衰减完就断掉，视觉上就是面板下方一条明显的横线。
+    `blur(radius: r)` 的可见扩散约 **2.5–3 × r**，留白必须 ≥ 这个值（定稿：留白 44 / `r = 12`）。
+    **这个留白只在关掉系统阴影时才安全** —— `hasShadow = false` 与「有留白」必须同时成立。
+    - 实测（纯白背景 + 逐行亮度剖面）：留白 22 + `r 9` → 阴影跨度 22pt，窗口边界前 3px 亮度跳变 **+0.038**（可见硬边）；
+      留白 44 + `r 12` → 跨度 36pt，同样指标 **+0.004**（平缓）。对比图：`build/search-panel-shadow-natural.png`
+  - ⚠️ 反过来，只要**开着**系统窗口阴影，留白就必须是 **0**：系统阴影最暗处永远落在**窗口边缘**，
+    留白会把它「晾」在玻璃外侧，成为面板下方一条多余的黑线（底缘剖面变成 0.703 → **0.478** → 0.612
+    的「先暗后亮」非单调形态）。`.titled` 窗口的 28pt titlebar 被 SwiftUI 当 safe area，会造成同样的错位。
+  - 切换：`defaults write com.waycast.macos WAYCAST_SHADOW_MODE -string soft|system|none`（`system` = 旧的直角观感）
+  - 面板位置记忆存的是**玻璃**左上角而不是窗口的 —— 窗口四周有一圈留白，存窗口角会让留白取值一变位置就漂。
+  - 历史问题的像素剖面实录（黑线 = 非单调塌陷）：`build/search-panel-edge-fix.png`、`build/search-panel-corner-fix.png`
 
 ## 5. 剪贴板历史
 
