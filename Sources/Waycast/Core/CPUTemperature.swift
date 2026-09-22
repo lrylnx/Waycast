@@ -4,23 +4,30 @@ import Darwin
 
 /// 状态栏「CPU 温度」图标。
 ///
-/// ## 通道（已实测）
-/// Apple Silicon 上 `AppleSMC` 已经没有可用的 CPU 温度键（老 Intel 时代的
-/// `TC0P` 之类整批消失），真实温度在 IOHID 的 AppleVendor 温度传感器里，
-/// 用 IOHIDEventSystemClient 枚举、`kIOHIDEventTypeTemperature` 取值。
+/// ## 通道（实测修正）
 ///
-/// 实测（macOS 26 / arm64，本机）：
-///  - 共 63 个温度服务 / 28 个唯一名称：`PMU tdie0`–`PMU tdie10`（CPU 核心）、
-///    `PMU TP*s`/`TP*g`（簇）、`PMU tdev1`–`tdev8`（板级）、`NAND CH0 temp`（SSD）、
-///    `gas gauge battery`（电池）、`PMU tcal`（校准参考）。
-///  - 压满 CPU 35 秒后 `PMU tdie*` 整体升 3.7–4.2°C，确认它们就是核心温度。
-///  - `PMU tcal` 恒定 51.85°C，是校准值不是真实温度，必须排除。
-///  - **不需要 root，也不需要任何新权限**（纯用户态 IOKit 枚举）。
+/// **首选 SMC 的 `TC[0-9]*`（CPU 核心），IOHID 的 `PMU tdie*` 降级为兜底。**
 ///
-/// ## 私有 API 的兜底
-/// `IOHIDEventSystemClient*` 是 IOKit 导出的私有符号。这里用 dlsym 动态解析
-/// 而不是 `@_silgen_name` 硬链接 —— 万一将来某个 macOS 把它删了，应用照常启动，
-/// 只是这个图标显示「—°C」，而不是整个 App 起不来。
+/// 早先版本认为「Apple Silicon 上 AppleSMC 已经没有可用的 CPU 温度键」——**那是错的**。
+/// AppleSMC 能正常打开，只是键名从 Intel 的 `TC0P` 换成了 `TC10`–`TC53`。
+/// 而 IOHID 的 `PMU tdie*` 虽然读得到、刷新率也有 3.5Hz，但对负载几乎无响应：
+///
+/// | 通道 | 空闲 | 10 核满载 60s | 涨幅 |
+/// |---|---|---|---|
+/// | IOHID `PMU tdie*`（旧） | 46.5°C | 47.9°C | +1.4°C |
+/// | SMC `TC[0-9]*`（新） | 50.2°C | 61.9°C | **+11.6°C** |
+///
+/// `PMU tdie*` 那 11 个「核心」读数彼此差不到 0.6°C —— 真实多核 CPU 不可能这么齐，
+/// 说明它是 **SoC 级平均温度**，多核一摊薄就对负载失去响应。用户反馈的
+/// 「跑满大负荷才慢吞吞升 1 度」就是它造成的。
+///
+/// 两条通道都**不需要 root，也不需要任何新权限**（纯用户态 IOKit）。
+///
+/// ## IOHID 兜底的注意事项
+///  - `PMU tcal` 恒定 51.85°C，是校准值不是真实温度，**必须排除**，否则取 max
+///    会被这个假值永久锁死。
+///  - `PMU tdev4`/`tdev5` 在部分机型上明显偏低（本机 36°C，其余 tdev 45°C+），
+///    混进 max 会拉低读数，所以只取 `PMU tdie*`。
 final class CPUTemperatureIcon {
     static let shared = CPUTemperatureIcon()
 
@@ -93,7 +100,16 @@ final class CPUTemperatureIcon {
 // MARK: - 采样
 
 final class CPUTemperatureSampler {
+
+    /// 读数来自哪条通道。SMC 优先，IOHID 是兜底。
+    enum Source {
+        case smc          // AppleSMC 的 TC[0-9]*（CPU 核心，对负载敏感）
+        case ioHID        // IOHID 的 PMU tdie*（SoC 平均温度，反应迟钝）
+        case unavailable
+    }
+
     private let api = HIDTemperatureAPI.shared
+    private let smc = SMCTemperatureReader()
 
     /// 必须持有客户端：服务引用由客户端持有，客户端一释放，
     /// 之前拿到的 service 指针全部失效（会直接崩在 release 上）。
@@ -103,10 +119,11 @@ final class CPUTemperatureSampler {
     private var lastEnumeration = Date.distantPast
 
     private(set) var latest: Double?
+    private(set) var source: Source = .unavailable
     private var didLogUnavailable = false
 
-    /// 是否可用（找不到私有符号时为 false，图标显示「—°C」）。
-    var isSupported: Bool { api.isAvailable }
+    /// 是否可用（两条通道都拿不到时为 false，图标显示「—°C」）。
+    var isSupported: Bool { smc.isAvailable || api.isAvailable }
 
     private static let sensorMatching: [String: Any] = [
         "PrimaryUsagePage": 0xff00,   // kHIDPage_AppleVendor
@@ -117,16 +134,30 @@ final class CPUTemperatureSampler {
 
     /// 返回当前最热的 CPU 核心温度（°C）。读不到返回 nil。
     func sample() -> Double? {
+        // 1) 首选 AppleSMC 的 CPU 核心温度 —— 这条才对负载敏感。
+        if smc.open(), let value = smc.readCoreMaximum(), value > 0 {
+            latest = value
+            source = .smc
+            return value
+        }
+
+        // 2) 退回 IOHID。它是 SoC 级平均温度、反应迟钝，但能给出趋势，
+        //    总好过显示「—°C」。
         guard api.isAvailable else {
             if !didLogUnavailable {
                 didLogUnavailable = true
-                NSLog("[Waycast] CPU 温度不可用：IOHID 温度接口未找到")
+                NSLog("[Waycast] CPU 温度不可用：SMC 与 IOHID 两条通道都没拿到")
             }
             latest = nil
+            source = .unavailable
             return nil
         }
         if client == nil { openClient() }
-        guard client != nil else { latest = nil; return nil }
+        guard client != nil else {
+            latest = nil
+            source = .unavailable
+            return nil
+        }
 
         // 每 30 秒重新枚举一次：休眠唤醒后服务可能失效，重建即可自愈。
         if sensors.isEmpty || Date().timeIntervalSince(lastEnumeration) > 30 {
@@ -144,6 +175,7 @@ final class CPUTemperatureSampler {
 
         let result = hottest > 0 ? hottest : nil
         latest = result
+        source = result == nil ? .unavailable : .ioHID
         return result
     }
 
