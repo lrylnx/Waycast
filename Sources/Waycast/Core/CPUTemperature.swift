@@ -2,9 +2,17 @@ import Cocoa
 import IOKit
 import Darwin
 
-/// 状态栏「CPU 温度」图标。
+/// 状态栏「CPU 温度 + 占用率」图标 —— **上下两行**，上行占用率、下行温度。
 ///
-/// ## 通道（实测修正）
+/// ## 为什么从单行改成两行
+///
+/// 单行只画一个温度，却要占 36pt 宽（5 字符 × 6.80pt + 边距）—— 而菜单栏里默认的
+/// 闪电图标墨迹只有 13px、内存水位杯 18px。一个数字占掉两倍宽度、上下还空着，
+/// 又宽又单调。改成上下两行（上行占用率 3 字符、下行温度 4 字符，按 4 字符预留宽度）
+/// 后，图标降到 30pt 宽、20pt 高，墨迹从 27×9px 变成 27×20px
+/// —— **更窄，却多带了一个读数**。
+///
+/// ## 温度通道（实测修正）
 ///
 /// **首选 SMC 的 `TC[0-9]*`（CPU 核心），IOHID 的 `PMU tdie*` 降级为兜底。**
 ///
@@ -40,11 +48,11 @@ final class CPUTemperatureIcon {
     private init() {}
 
     func start() {
-        render(sampler.sample())
+        render(sampler.sample(), CPUUsageSampler.shared.sample())
         guard timer == nil else { return }
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.render(self.sampler.sample())
+            self.render(self.sampler.sample(), CPUUsageSampler.shared.sample())
         }
         t.tolerance = 0.2
         RunLoop.main.add(t, forMode: .common)
@@ -71,10 +79,47 @@ final class CPUTemperatureIcon {
         return nil
     }
 
-    /// 恒为 5 字符（" 42°C" / "105°C" / "  —°C"），配合 SF Mono 保证宽度不抖。
-    static func displayText(_ celsius: Double?) -> String {
-        let number = sanitized(celsius).map { String(format: "%3.0f", $0.rounded()) } ?? "  —"
-        return number + "°C"
+    /// 图标的**预留宽度**样板：按 `"100%"` 预留 4 字符。
+    ///
+    /// 平时占用率是 3 字符（`"24%"`）、温度是 4 字符（`"42°C"`），按 4 字符预留后
+    /// 图标宽度恒为 30pt，不随数值位数跳动 —— 否则 `"24%"` ↔ `"100%"` 一变，
+    /// 那一瞬间右边一整排菜单栏图标都会跟着横移。
+    ///
+    /// 唯一的例外是温度冲到 **100°C 以上**：`"100°C"` 是 5 字符、超出预留，
+    /// 图标会临时宽到 36pt。刻意不按 5 字符预留 —— 那会让图标**永远**是 36pt，
+    /// 而 100°C+ 是极罕见的过热状态，不值得为它常态化多占 6pt。
+    ///
+    /// 不设为 private：离线校验脚本要拿它渲染「最宽的那一档」来核对宽度。
+    static let widthTemplate = "100%"
+
+    /// 图标文字：**两行** —— 上行 CPU 占用率，下行温度。
+    ///
+    /// 上行 3~4 字符（`"08%"` / `"100%"`），下行 4~5 字符（`"08°C"` / `"100°C"`），
+    /// 两行各自在自己的宽度里居中，视觉中心对齐。
+    static func displayText(celsius: Double?, usage: Double?) -> String {
+        "\(usageField(usage))\n\(temperatureField(celsius))"
+    }
+
+    /// 占用率字段：`"08%"` / `"19%"` / `"100%"`；拿不到时 `"--%"`。
+    ///
+    /// **个位数补前导零**（`8%` → `08%`）是刻意的：不补的话 `"8%"` 只有 2 字符、
+    /// `"19%"` 有 3 字符，数字的位次就会随读数左右跳，看着不齐。
+    static func usageField(_ usage: Double?) -> String {
+        // 拿不到读数时用 `--` 占满两格（而不是单个 `—`），否则会和正常读数差一格。
+        guard let usage, usage.isFinite else { return "--%" }
+        // %02.0f 只补到 2 位；三位数（100）会照常写满 3 位，不会被截断。
+        return String(format: "%02.0f%%", min(max(usage.rounded(), 0), 100))
+    }
+
+    /// 温度字段：`"08°C"` / `"42°C"` / `"100°C"`；拿不到时 `"--°C"`。
+    ///
+    /// 同样补前导零，理由同上。
+    ///
+    /// **单位写成 `°C` 而不是光一个 `°`**：试过省掉 `C` 好让两行都是 3 字符，但
+    /// 菜单栏里孤零零一个 `°` 看着像句号、不成字，反而更难看。宁可多占一格。
+    static func temperatureField(_ celsius: Double?) -> String {
+        guard let celsius = sanitized(celsius) else { return "--°C" }
+        return String(format: "%02.0f°C", celsius.rounded())
     }
 
     private static func sanitized(_ celsius: Double?) -> Double? {
@@ -82,17 +127,22 @@ final class CPUTemperatureIcon {
         return celsius
     }
 
-    private func render(_ celsius: Double?) {
+    private func render(_ celsius: Double?, _ usage: Double?) {
         let value = Self.sanitized(celsius)
-        let text = Self.displayText(value)
+        let text = Self.displayText(celsius: value, usage: usage)
         let image: NSImage
+        // 报警色只看**温度**：占用率再高也不是异常（满核跑满本来就是正常工况），
+        // 拿它报警会天天红。染色是整块图标一起染，两行同色。
         if let value, let color = Self.severityColor(value.rounded()) {
-            image = StatusTextIcon.render(text, color: color, template: false)
+            image = StatusTextIcon.render(text, color: color, template: false,
+                                          widthTemplate: Self.widthTemplate)
         } else {
-            image = StatusTextIcon.render(text, template: true)
+            image = StatusTextIcon.render(text, template: true,
+                                          widthTemplate: Self.widthTemplate)
         }
-        image.accessibilityDescription = value.map { "CPU 温度 \(Int($0.rounded())) 摄氏度" }
-            ?? "CPU 温度不可用"
+        let temperatureText = value.map { "\(Int($0.rounded())) 摄氏度" } ?? "不可用"
+        let usageText = usage.flatMap { $0.isFinite ? "\(Int($0.rounded()))%" : nil } ?? "不可用"
+        image.accessibilityDescription = "CPU 温度 \(temperatureText)，占用 \(usageText)"
         onIconUpdate?(image)
     }
 }

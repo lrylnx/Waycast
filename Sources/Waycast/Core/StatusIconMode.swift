@@ -14,7 +14,7 @@ enum StatusIconMode: String, CaseIterable {
         case .bolt:    return "默认图标"
         case .memory:  return "内存水位图标"
         case .network: return "网速图标"
-        case .cpuTemp: return "CPU 温度图标"
+        case .cpuTemp: return "CPU 温度 + 占用图标"
         }
     }
 
@@ -73,7 +73,8 @@ enum StatusTextIcon {
 
     /// 把一行或多行文字画成状态栏图标。
     ///
-    /// 用 `"\n"` 分隔多行 —— 目前只有网速用两行（`↓1.2M` 一行、`↑340K` 一行）。
+    /// 用 `"\n"` 分隔多行 —— 网速是 `↑1.2M` / `↓340K` 两行，
+    /// CPU 是占用率 / 温度两行。
     ///
     /// **为什么多行要按「墨迹范围」裁着堆叠，而不是交给 `NSAttributedString` 排：**
     /// 菜单栏实测只有 22pt 高（`NSStatusBar.system.thickness`）。11pt 字体按
@@ -83,9 +84,13 @@ enum StatusTextIcon {
     ///
     /// - Parameter template: true 时交给系统按菜单栏明暗自动上色（并跟随点击高亮），
     ///   这是文字类图标最稳的做法；需要按数值报警上色时才传 false。
+    /// - Parameter widthTemplate: 可选。一段「样板文字」，其排版宽度作为图标的
+    ///   **最小宽度**。用于数值位数会变的场景（如 CPU 占用 `"12%"` → `"100%"`）：
+    ///   即使当前只显示 3 字符，也按 4 字符预留宽度，图标宽度才不会随数值跳变。
     static func render(_ text: String,
                        color: NSColor? = nil,
                        template: Bool,
+                       widthTemplate: String? = nil,
                        scale: CGFloat = 2) -> NSImage {
         let textFont = font()
         let attrs: [NSAttributedString.Key: Any] = [
@@ -115,9 +120,18 @@ enum StatusTextIcon {
                 return (attributed, attributed.size().width, ink)
             }
 
-        // 宽度仍按**排版宽度**取最大值，这样单行图标的宽度和加多行之前分毫不差
-        // （SF Mono 等宽 → 固定字符数 = 固定宽度 → 图标不会每秒抖）。
-        let contentWidth = measured.map(\.advance).max() ?? 0
+        // 宽度仍取**排版宽度**的最大值（不是墨迹）—— SF Mono 等宽 → 固定字符数 =
+        // 固定宽度 → 图标不会每秒抖。
+        //
+        // 并且要跟 `widthTemplate` 取较大者：数值位数会变的图标（CPU 占用/温度）
+        // 需要按"最长可能出现的样子"预留。否则 `"12%"`(3) 变 `"100%"`(4) 的一瞬间
+        // 图标会宽出 7pt，右边整排菜单栏图标跟着横移一下 —— 这正是本 skill 反复
+        // 踩过的坑。预留后每行都在这个固定宽度里居中，位数变化只影响墨迹、不影响宽度。
+        let reservedWidth: CGFloat = (widthTemplate ?? "")
+            .components(separatedBy: "\n")
+            .map { NSAttributedString(string: $0, attributes: attrs).size().width }
+            .max() ?? 0
+        let contentWidth = max(measured.map(\.advance).max() ?? 0, reservedWidth)
         let widthPt = ceil(contentWidth) + 2        // 左右各留 1pt，避免贴住邻居
 
         // 高度按墨迹累加：两行 = 8 + 2 + 8 = 18pt；单行 = 8pt。
@@ -151,12 +165,14 @@ enum StatusTextIcon {
         // 会整体偏下约 1.5~2pt，两层叠起来就歪了。
         //
         // 水平对齐分两种，别混：
-        // - **单行**（CPU 温度）按**墨迹**居中。温度是定宽 5 字符，位数不同时
-        //   前面补空格（"  8°C" / " 42°C" / "105°C"），若按 advance 对齐，
-        //   墨迹会随数字位数在图标里左右滑动（实测 " 42°C" 时右边只剩 1pt、
-        //   左边空 7.8pt，看起来明显偏右）。按墨迹居中后左右留白恒定相等。
-        // - **多行**（网速）按 **advance** 对齐，让两行的字符格子起点重合；
-        //   否则 "↑340K" 和 "↓ 12K"（一个带前导空格）的箭头会左右错位。
+        // - **单行**按**墨迹**居中，让左右留白相等。
+        // - **多行**按 **advance** 居中：每行各自在「排版宽度」里居中，两行的
+        //   视觉中心因此重合。网速靠它让上下两个箭头对齐；CPU 双行靠它在
+        //   「3 字符 / 4 字符」之间切换时始终居中。
+        //
+        //   注意**不要靠补前导空格来凑定宽** —— 前导空格没有墨，等于把整块墨迹
+        //   往右推（实测 " 42°C" 按 advance 对齐后左边空 7.8pt、右边只剩 1pt，
+        //   明显偏右）。要定宽就用上面的 `widthTemplate` 预留，别塞空格。
         let inkCentered = measured.count == 1
         var cursorTop = heightPt                    // 当前行的墨迹顶边
         for (index, m) in measured.enumerated() {

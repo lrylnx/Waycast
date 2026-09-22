@@ -67,6 +67,9 @@ final class StatusIconCenter {
 
     /// 菜单打开时踩一脚采样器：网速要靠前后两拍才能算出速率，
     /// 这样菜单里的读数能在 1 秒内变成真值。
+    ///
+    /// **CPU 占用率刻意不在这里预热**：预热不会让它的值变准，只会把
+    /// 「上一次采样到现在」的长窗口平均冒充成即时值（见 `isFresh`）。
     func primeMenuReadings() {
         _ = NetworkSpeedSampler.shared.sample()
     }
@@ -86,8 +89,20 @@ final class StatusIconCenter {
             guard NetworkSpeedSampler.shared.hasBaseline else { return nil }
             return NetReadings.network(sample)
         case .cpuTemp:
-            guard let celsius = temperatureSampler.sample() else { return nil }
-            return "\(Int(celsius.rounded()))°C"
+            // 图标上是「占用率 / 温度」两行，菜单里写成一行完整读数。
+            //
+            // 占用率只在**图标正在跑**（每秒采一次、读数是 1 秒窗口）时才显示；
+            // 否则现采一次算出来的是「上次采样到现在」的平均，跨度可能几小时，
+            // 显示它反而误导 —— 这时就只报温度。
+            let usage = CPUUsageSampler.shared.isFresh ? CPUUsageSampler.shared.sample() : nil
+            let temperature = temperatureSampler.sample()
+                .map { "\(Int($0.rounded()))°C" }
+            switch (temperature, usage) {
+            case let (t?, u?):  return "\(t) · \(Int(u.rounded()))%"
+            case let (t?, nil): return t
+            case let (nil, u?): return "占用 \(Int(u.rounded()))%"
+            case (nil, nil):    return nil
+            }
         }
     }
 }
