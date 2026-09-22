@@ -14,17 +14,7 @@ enum StatusIconMode: String, CaseIterable {
         case .bolt:    return "默认图标"
         case .memory:  return "内存水位图标"
         case .network: return "网速图标"
-        case .cpuTemp: return "CPU 温度 + 占用图标"
-        }
-    }
-
-    /// 菜单里展示的实时读数后缀（菜单打开时才会刷新）。
-    var readingLabel: String {
-        switch self {
-        case .bolt:    return ""
-        case .memory:  return "内存"
-        case .network: return "网速"
-        case .cpuTemp: return "CPU"
+        case .cpuTemp: return "CPU 温度"
         }
     }
 }
