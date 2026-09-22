@@ -42,18 +42,21 @@ final class NetworkSpeedIcon {
         timer = nil
     }
 
-    /// 状态栏图标上的文字，**两行**、每行恒为 5 字符（"↓512B" / "↑340K"）。
+    /// 状态栏图标上的文字，**两行**、每行恒为 5 字符（"↑340K" / "↓1.2M"）。
     ///
     /// 单独抽出来是为了让"图标渲染"和"离线校验"走同一条代码路径 ——
     /// 校验脚本里手写字符串副本，就会量到和实际不符的宽度。
     ///
     /// **为什么改成上下两行：** 并排写要 10 个字符 ≈ 70pt，在菜单栏里横着占
-    /// 一大截，右边一排图标都被挤走。改成上"↓"下"↑"后宽度只剩 5 字符 ≈ 36pt，
+    /// 一大截，右边一排图标都被挤走。改成两个 5 字符的短行后宽度只剩 ≈ 36pt，
     /// 和 CPU 温度图标一样宽。代价是高度要占两层：11pt 字体按自然行距排两行
     /// 需要 30pt，超过菜单栏的 22pt，所以渲染侧改成按墨迹裁着堆叠（见
-    /// `StatusTextIcon.render`），两层合计 18pt。
+    /// `StatusTextIcon.render`），两层合计 20pt。
+    ///
+    /// **行序：上行在上、下行在下** —— 箭头朝向要和所在行的位置一致，
+    /// 上面那行画 "↑"（上行），下面那行画 "↓"（下行）。
     static func displayText(_ s: NetworkSpeedSample) -> String {
-        "↓\(RateFormat.short(s.rxBytesPerSec))\n↑\(RateFormat.short(s.txBytesPerSec))"
+        "↑\(RateFormat.short(s.txBytesPerSec))\n↓\(RateFormat.short(s.rxBytesPerSec))"
     }
 
     private func render(_ s: NetworkSpeedSample) {

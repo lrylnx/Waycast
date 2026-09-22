@@ -45,11 +45,27 @@ enum StatusTextIcon {
     /// 右侧菜单栏里其它图标就跟着左右晃。SF Mono 实测每个字符（含 ↓ ↑
     /// 空格 字母 小数点）宽度完全一致，所以按固定字符数排版宽度就天然恒定。
     ///
-    /// **字重：选 `.bold`。** 实测 SF Mono 的字符宽度与字重无关
-    /// （11pt 下 regular/medium/semibold/bold 都是 6.80pt），加粗不占位置，
-    /// 在非 Retina 屏上还能明显提升小字号数字的可读性。
+    /// **字重：选 `.heavy`。** 实测 SF Mono 的字符宽度与字重无关
+    /// （11pt 下 regular/medium/semibold/bold/heavy 都是 6.80pt），加粗不占位置。
+    ///
+    /// 为什么是 heavy 而不是 bold：把每种做法都渲染出来扫像素、算「墨迹覆盖率」
+    /// （墨迹像素数 ÷ 墨迹包围盒面积，越大笔画越粗）实测：
+    ///
+    /// | 配置 | 覆盖率 | 图标尺寸 |
+    /// |---|---|---|
+    /// | 11pt bold（原） | 0.358 | 36×9pt |
+    /// | **11pt heavy** | **0.438** | **36×9pt** |
+    /// | 11.5pt bold | 0.360 | 38×9pt |
+    /// | 12pt bold | 0.358 | 40×10pt |
+    /// | 12pt heavy | 0.430 | 40×10pt |
+    /// | 11pt bold + strokeWidth -1.2 | 0.398 | 36×9pt |
+    ///
+    /// 结论很反直觉：**加大字号几乎不增加笔画粗细**（12pt bold 还是 0.358，
+    /// 只是整体放大），而且两行网速会从 20pt 涨到 22pt、正好顶满菜单栏。
+    /// `.heavy` 才是把笔画真正加粗的那个（+22%），且尺寸分毫不变。
+    /// （`.black` 实测与 `.heavy` 完全相同 —— SF Mono 没有更重的字重，会 fallback。）
     static func font() -> NSFont {
-        NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+        NSFont.monospacedSystemFont(ofSize: 11, weight: .heavy)
     }
 
     /// 单行内两层的行距（pt）。字面已经贴紧了，再留 2pt 免得两行糊在一起。
@@ -133,11 +149,21 @@ enum StatusTextIcon {
         // 自顶向下逐行堆叠。注意 `ink.origin` 是墨迹相对**绘制原点**的偏移，
         // 必须把它减掉才能让墨迹边（而不是排版行盒）落在目标位置 —— 否则每行
         // 会整体偏下约 1.5~2pt，两层叠起来就歪了。
+        //
+        // 水平对齐分两种，别混：
+        // - **单行**（CPU 温度）按**墨迹**居中。温度是定宽 5 字符，位数不同时
+        //   前面补空格（"  8°C" / " 42°C" / "105°C"），若按 advance 对齐，
+        //   墨迹会随数字位数在图标里左右滑动（实测 " 42°C" 时右边只剩 1pt、
+        //   左边空 7.8pt，看起来明显偏右）。按墨迹居中后左右留白恒定相等。
+        // - **多行**（网速）按 **advance** 对齐，让两行的字符格子起点重合；
+        //   否则 "↑340K" 和 "↓ 12K"（一个带前导空格）的箭头会左右错位。
+        let inkCentered = measured.count == 1
         var cursorTop = heightPt                    // 当前行的墨迹顶边
         for (index, m) in measured.enumerated() {
             let inkBottom = cursorTop - inkHeights[index]
-            // 水平方向按 advance 居中对齐，两行的字符格子起点完全重合。
-            let x = 1 + (contentWidth - m.advance) / 2 - m.ink.origin.x
+            let x = inkCentered
+                ? (widthPt - m.ink.width) / 2 - m.ink.origin.x
+                : 1 + (contentWidth - m.advance) / 2 - m.ink.origin.x
             let y = inkBottom - m.ink.origin.y
             m.text.draw(at: NSPoint(x: x, y: y))
             cursorTop = inkBottom - lineGap
