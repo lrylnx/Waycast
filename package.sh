@@ -55,6 +55,25 @@ echo "==> 校验代码签名"
 codesign --verify --deep --strict "${APP_DIR}"
 echo "    ✓ 签名有效"
 
+# 再解压一次校验 —— 这一步才真正模拟用户拿到 zip 之后的状态。
+#
+# ⚠️ 必须用 `ditto -x -k`（Finder 双击走的就是它）。用 `unzip` 会把 macOS 的
+# AppleDouble 资源分叉（`._Waycast` / `._AppIcon.icns` / `._Info.plist`…）当成
+# 普通文件解出来，凭空多出 7 个文件、签名封条被破坏，于是 codesign 报
+# "a sealed resource is missing or invalid"。那不是包坏了，是用错了工具 ——
+# 别再被它骗一次。
+UNPACK_DIR="$(mktemp -d)"
+trap 'rm -rf "${UNPACK_DIR}"' EXIT
+if ! ditto -x -k "${ZIP_PATH}" "${UNPACK_DIR}"; then
+  echo "✗ 解压失败"
+  exit 1
+fi
+if ! codesign --verify --deep --strict "${UNPACK_DIR}/${APP_NAME}.app"; then
+  echo "✗ 解压后签名校验失败（zip 本身可能已损坏）"
+  exit 1
+fi
+echo "    ✓ 解压后签名仍有效（ditto 解压，与用户拿到包时一致）"
+
 echo ""
 echo "✅ 完成：${ZIP_PATH}"
 echo "   sha256: $(shasum -a 256 "${ZIP_PATH}" | awk '{print $1}')"
