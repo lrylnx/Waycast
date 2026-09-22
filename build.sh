@@ -13,6 +13,14 @@ BUILD_DIR=".build"
 APP_DIR="build/${APP_NAME}.app"
 SIGN_IDENTITY="${WAYCAST_SIGN_IDENTITY:-Waycast Developer}"
 
+# 图标素材改过就先重编 Assets.car（需要 Xcode；产物已入库，普通构建用不着）
+if [ -f Resources/AppIcon.icon/icon.json ]; then
+  if [ ! -f Resources/Assets.car ] || [ -n "$(find Resources/AppIcon.icon -type f -newer Resources/Assets.car 2>/dev/null | head -n1)" ]; then
+    echo "==> 图标素材有更新，重新编译 Resources/Assets.car"
+    ./icon.sh
+  fi
+fi
+
 echo "==> swift build -c ${CONFIG}"
 # --disable-sandbox: inside restricted environments swift-build's own
 # sandbox-exec fails with "Operation not permitted"; the outer build
@@ -27,6 +35,8 @@ mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
 cp "${BIN}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 cp Resources/Info.plist "${APP_DIR}/Contents/Info.plist"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
+# macOS 26+ 的原生图标。缺了它 Tahoe 会把图标缩小 20% 塞进灰色托盘。
+[ -f Resources/Assets.car ] && cp Resources/Assets.car "${APP_DIR}/Contents/Resources/Assets.car"
 printf 'APPL????' > "${APP_DIR}/Contents/PkgInfo"
 
 echo "==> codesign (identity: ${SIGN_IDENTITY})"

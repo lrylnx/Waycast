@@ -1,0 +1,46 @@
+{
+  "fill": {
+    "solid": "srgb:0.44706,0.60000,1.00000,1.00000"
+  },
+  "groups": [
+    {
+      "name": "App Icon",
+      "layers": [
+        {
+          "image-name": "foreground.png",
+          "name": "foreground",
+          "position": {
+            "scale": 1,
+            "translation-in-points": [
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "image-name": "background.png",
+          "name": "background",
+          "position": {
+            "scale": 1,
+            "translation-in-points": [
+              0,
+              0
+            ]
+          },
+          "hidden-specializations": [
+            {
+              "value": false
+            },
+            {
+              "appearance": "tinted",
+              "value": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

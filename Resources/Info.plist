@@ -18,6 +18,10 @@
     <string>Waycast</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <!-- macOS 26+ 用 Assets.car 里的原生 Liquid Glass 图标；老系统回退到上面那份 AppIcon.icns。
+         没有这个键，Tahoe 会把图标判定为旧式图标，缩小约 20% 塞进灰色托盘（icon jail）。 -->
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleLocalizations</key>
