@@ -8,32 +8,15 @@ import Darwin
 ///  - 1Hz 定时器只推进波浪相位并重绘一张 18×20pt 的小位图
 ///  - 未启用时定时器完全销毁，零开销
 ///  - 采样用 host_statistics64（纯 mach 调用，无进程遍历）
+///
+/// 启停由 `StatusIconCenter` 统一调度（状态栏图标四选一），这里只负责画。
 final class MemoryWaterline {
     static let shared = MemoryWaterline()
 
     /// 图标更新回调（主线程）；nil 表示恢复默认图标。
     var onIconUpdate: ((NSImage?) -> Void)?
-    /// 开关状态变化回调（主线程），供菜单勾选同步。
-    var onChange: (() -> Void)?
 
-    var isEnabled: Bool {
-        get { AppSettings.shared.statusIconWaterline }
-        set {
-            guard newValue != isEnabled else { return }
-            AppSettings.shared.statusIconWaterline = newValue
-            newValue ? start() : stop()
-            DispatchQueue.main.async { self.onChange?() }
-        }
-    }
-
-    func toggle() { isEnabled.toggle() }
-
-    private init() {
-        if AppSettings.shared.statusIconWaterline {
-            // 启动时延迟一拍，等 AppDelegate 挂好 onIconUpdate
-            DispatchQueue.main.async { [weak self] in self?.start() }
-        }
-    }
+    private init() {}
 
     // MARK: - 采样 + 动画
 
@@ -42,7 +25,7 @@ final class MemoryWaterline {
     private var phase: Double = 0
     private var lastSample = WaterlineSample(total: 0, used: 0, usagePercent: 0, pressure: .low)
 
-    private func start() {
+    func start() {
         lastSample = monitor.sample()
         render()
         guard timer == nil else { return }
@@ -52,10 +35,11 @@ final class MemoryWaterline {
         timer = t
     }
 
-    private func stop() {
+    func stop() {
         timer?.invalidate()
         timer = nil
-        onIconUpdate?(nil)
+        // 有意不在这里抛 nil：切换图标时由 StatusIconCenter 决定画什么，
+        // 否则中间会闪一下默认闪电。
     }
 
     private func tick() {

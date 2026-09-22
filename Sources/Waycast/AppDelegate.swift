@@ -14,7 +14,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) lazy var captureController = CaptureController()
 
     private var hotkeyManager: HotkeyManager!
-    private weak var waterlineItem: NSMenuItem?
+    /// 状态栏图标四个互斥选项（默认闪电 / 内存水位 / 网速 / CPU 温度）。
+    private var statusIconItems: [StatusIconMode: NSMenuItem] = [:]
+    /// 菜单打开期间以 1Hz 刷新这几项的实时读数；菜单一关就销毁。
+    private var statusIconReadingsTimer: Timer?
     /// Self-heals the AppRing event tap (the system disables it after sleep /
     /// login, or until Accessibility is granted).
     private var appRingTapTimer: Timer?
@@ -123,14 +126,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = buildStatusMenu()
         statusItem.menu?.delegate = self
 
-        // Memory waterline icon (opt-in): pushes new frames into the button,
-        // nil restores the default bolt.
-        MemoryWaterline.shared.onIconUpdate = { [weak self] image in
+        // 状态栏图标总控：内存水位 / 网速 / CPU 温度 四选一，没启用的
+        // provider 定时器是 nil，不采样也不重绘。
+        StatusIconCenter.shared.onImageChange = { [weak self] image in
             self?.statusItem.button?.image = image ?? Self.defaultStatusImage()
         }
-        MemoryWaterline.shared.onChange = { [weak self] in
-            self?.waterlineItem?.state = MemoryWaterline.shared.isEnabled ? .on : .off
+        StatusIconCenter.shared.onModeChange = { [weak self] in
+            self?.syncStatusIconMenu()
         }
+        StatusIconCenter.shared.start()
     }
 
     private static func defaultStatusImage() -> NSImage? {
@@ -162,12 +166,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lock?.state = InputSourceLock.shared.isLocked ? .on : .off
         }
 
-        // 勾选后状态栏换成内存水位杯图标，再点一次切回默认闪电图标。
-        let water = NSMenuItem(title: "内存水位图标", action: #selector(toggleWaterline), keyEquivalent: "")
-        water.target = self
-        water.state = MemoryWaterline.shared.isEnabled ? .on : .off
-        menu.addItem(water)
-        waterlineItem = water
+        // 状态栏图标：四选一。勾选后状态栏换成对应读数，再点一次切回默认闪电图标。
+        // 菜单打开期间这几项还会带上实时读数（内存水位 42% / 网速 ↓1.2 MB/s / CPU 温度 48°C）。
+        for target in StatusIconMode.allCases {
+            let item = NSMenuItem(title: target.menuTitle,
+                                  action: #selector(selectStatusIcon(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = target.rawValue
+            item.state = StatusIconCenter.shared.mode == target ? .on : .off
+            menu.addItem(item)
+            statusIconItems[target] = item
+        }
 
         menu.addItem(.separator())
 
@@ -218,7 +228,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showSearch() { searchController.toggle() }
     @objc private func startCapture() { captureController.start() }
     @objc private func toggleInputLock() { InputSourceLock.shared.toggle() }
-    @objc private func toggleWaterline() { MemoryWaterline.shared.toggle() }
+
+    @objc private func selectStatusIcon(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let target = StatusIconMode(rawValue: raw) else { return }
+        StatusIconCenter.shared.toggle(target)
+    }
+
+    private func syncStatusIconMenu() {
+        for target in StatusIconMode.allCases {
+            guard let item = statusIconItems[target] else { continue }
+            item.state = StatusIconCenter.shared.mode == target ? .on : .off
+            item.title = target.menuTitle
+        }
+    }
+
+    // MARK: - 菜单里的实时读数
+
+    private func startStatusIconReadings() {
+        StatusIconCenter.shared.primeMenuReadings()
+        refreshStatusIconReadings()
+        guard statusIconReadingsTimer == nil else { return }
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            // 定时器挂在主 RunLoop 上，这里一定在主线程；assumeIsolated 避免
+            // 再排一次 Task（菜单读数要的是"马上刷新"）。
+            MainActor.assumeIsolated { self?.refreshStatusIconReadings() }
+        }
+        t.tolerance = 0.2
+        RunLoop.main.add(t, forMode: .common)
+        statusIconReadingsTimer = t
+    }
+
+    private func stopStatusIconReadings() {
+        statusIconReadingsTimer?.invalidate()
+        statusIconReadingsTimer = nil
+        // 关闭后把读数后缀去掉，菜单回到干净的形态。
+        for target in StatusIconMode.allCases {
+            statusIconItems[target]?.title = target.menuTitle
+        }
+    }
+
+    private func refreshStatusIconReadings() {
+        for target in StatusIconMode.allCases {
+            guard let item = statusIconItems[target] else { continue }
+            if let reading = StatusIconCenter.shared.reading(for: target) {
+                item.title = "\(target.menuTitle)  \(reading)"
+            } else {
+                item.title = target.menuTitle
+            }
+        }
+    }
 
     @objc private func openSettings() {
         NSApp.activate(ignoringOtherApps: true)
@@ -268,10 +327,12 @@ extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         statusMenuTracking = true
         statusMenuClosedAt = nil
+        startStatusIconReadings()
     }
 
     func menuDidClose(_ menu: NSMenu) {
         statusMenuTracking = false
         statusMenuClosedAt = Date()
+        stopStatusIconReadings()
     }
 }

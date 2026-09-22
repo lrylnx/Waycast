@@ -9,8 +9,9 @@ final class SettingsWindowController: NSWindowController {
         let hosting = NSHostingController(rootView: SettingsView())
         let window = NSWindow(contentViewController: hosting)
         window.title = "Waycast 设置"
-        window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 480, height: 400))
+        window.styleMask = [.titled, .closable, .resizable]
+        window.setContentSize(NSSize(width: 480, height: 560))
+        window.minSize = NSSize(width: 480, height: 420)
         window.isReleasedWhenClosed = false
         super.init(window: window)
     }
@@ -134,6 +135,7 @@ struct SettingsView: View {
     @State private var searchKey = AppSettings.shared.searchHotkey
     @State private var captureKey = AppSettings.shared.captureHotkey
     @State private var clipboardLimit = AppSettings.shared.clipboardLimit
+    @State private var statusIconMode = AppSettings.shared.statusIconMode
     @State private var autoStart = LaunchAtLogin.isEnabled
     @State private var autoStartError: String?
 
@@ -208,6 +210,23 @@ struct SettingsView: View {
                     .font(.caption).foregroundColor(.secondary)
             } header: {
                 Text("环形应用切换 (AppRing)").font(.headline)
+            }
+
+            Section {
+                Picker("状态栏图标", selection: $statusIconMode) {
+                    ForEach(StatusIconMode.allCases, id: \.self) { mode in
+                        Text(mode.menuTitle).tag(mode)
+                    }
+                }
+                .onChange(of: statusIconMode) { newValue in
+                    StatusIconCenter.shared.select(newValue)
+                }
+                Text("默认显示闪电图标，也可换成内存水位杯、实时网速或 CPU 温度。四者互斥，只有当前选中的那个在采样，其余零开销。")
+                    .font(.caption).foregroundColor(.secondary)
+                Text("网速统计所有物理网卡（Wi-Fi / 有线 / 个人热点）的合计上下行；CPU 温度取所有 CPU 核心里最高的那一路。")
+                    .font(.caption).foregroundColor(.secondary)
+            } header: {
+                Text("状态栏图标").font(.headline)
             }
 
             Section {

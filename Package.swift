@@ -16,6 +16,8 @@ let package = Package(
                 .linkedFramework("CoreServices"),
                 .linkedFramework("Vision"),
                 .linkedFramework("QuartzCore"),
+                // CPU 温度走 IOHID 的 AppleVendor 温度传感器（IOHIDEventSystemClient）。
+                .linkedFramework("IOKit"),
                 .linkedFramework("ScreenCaptureKit", .when(platforms: [.macOS])),
             ]
         )

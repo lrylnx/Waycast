@@ -44,10 +44,17 @@ final class AppSettings {
         set { defaults.set(newValue, forKey: "searchScopePaths") }
     }
 
-    /// Status bar shows the memory waterline cup icon instead of the bolt.
-    var statusIconWaterline: Bool {
-        get { defaults.bool(forKey: "statusIconWaterline") }
-        set { defaults.set(newValue, forKey: "statusIconWaterline") }
+    /// 状态栏图标模式（默认闪电 / 内存水位 / 网速 / CPU 温度，四者互斥）。
+    var statusIconMode: StatusIconMode {
+        get {
+            if let raw = defaults.string(forKey: "statusIconMode"),
+               let mode = StatusIconMode(rawValue: raw) {
+                return mode
+            }
+            // 老版本只有一个 Bool 开关（内存水位图标），迁移一次。
+            return defaults.bool(forKey: "statusIconWaterline") ? .memory : .bolt
+        }
+        set { defaults.set(newValue.rawValue, forKey: "statusIconMode") }
     }
 
     // MARK: - Search panel position (remembered per display)
