@@ -135,6 +135,7 @@ struct SettingsView: View {
     @State private var searchKey = AppSettings.shared.searchHotkey
     @State private var captureKey = AppSettings.shared.captureHotkey
     @State private var clipboardLimit = AppSettings.shared.clipboardLimit
+    @State private var captureDim = AppSettings.shared.captureDimOpacity
     @State private var statusIconMode = AppSettings.shared.statusIconMode
     @State private var autoStart = LaunchAtLogin.isEnabled
     @State private var autoStartError: String?
@@ -243,6 +244,22 @@ struct SettingsView: View {
                 Text("剪贴板").font(.headline)
             }
             .onChange(of: clipboardLimit) { AppSettings.shared.clipboardLimit = $0 }
+
+            Section {
+                HStack {
+                    Text("选区外遮罩")
+                    Slider(value: $captureDim, in: 0.1...0.8, step: 0.05)
+                    Text("\(Int((captureDim * 100).rounded()))%")
+                        .foregroundColor(.secondary)
+                        .monospacedDigit()
+                        .frame(width: 42, alignment: .trailing)
+                }
+                Text("按 F1 后，框选区域之外会被压暗这个比例——越暗，选区越突出。默认 45%。")
+                    .font(.caption).foregroundColor(.secondary)
+            } header: {
+                Text("截图").font(.headline)
+            }
+            .onChange(of: captureDim) { AppSettings.shared.captureDimOpacity = $0 }
 
             Section {
                 Text("截图（Mio 冻结帧方案）：按 F1 后所有屏幕先定格成静帧，拖拽框选区域后点「复制 / OCR / 保存」；悬停时窗口会高亮，直接单击窗口即整窗截图（自带透明圆角），Shift+单击窗口则识别窗口内文字。Esc 或右键取消。")

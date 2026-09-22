@@ -43,7 +43,11 @@ final class PinnedShotView: NSView {
     var onOCR: (() -> Void)?
 
     private let image: CGImage
+    /// 悬停工具条的内容（OCR / 关闭）。
     private let hoverBar: NSStackView
+    /// 工具条的外壳：macOS 26+ 是液态玻璃，旧系统是半透明色块。
+    /// lazy：尺寸取 fittingSize，必须在按钮都加进去之后才算得准。
+    private lazy var hoverChrome: NSView = GlassBackdrop.wrap(hoverBar, cornerRadius: 10)
     private var hoverArea: NSTrackingArea?
 
     init(frame: NSRect, image: CGImage) {
@@ -85,24 +89,15 @@ final class PinnedShotView: NSView {
 
         hoverBar.orientation = .horizontal
         hoverBar.spacing = 2
-        hoverBar.edgeInsets = NSEdgeInsets(top: 3, left: 5, bottom: 3, right: 5)
+        hoverBar.edgeInsets = NSEdgeInsets(top: 4, left: 6, bottom: 4, right: 6)
         hoverBar.addArrangedSubview(ocr)
         hoverBar.addArrangedSubview(close)
-        hoverBar.wantsLayer = true
-        hoverBar.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
-        hoverBar.layer?.cornerRadius = 7
-        hoverBar.layer?.borderWidth = 0.5
-        hoverBar.layer?.borderColor = NSColor.white.withAlphaComponent(0.25).cgColor
-        hoverBar.layer?.shadowColor = NSColor.black.cgColor
-        hoverBar.layer?.shadowOpacity = 0.3
-        hoverBar.layer?.shadowRadius = 6
-        hoverBar.layer?.shadowOffset = NSSize(width: 0, height: -2)
-        addSubview(hoverBar)
-        let barSize = hoverBar.fittingSize
-        hoverBar.setFrameSize(barSize)
-        hoverBar.setFrameOrigin(NSPoint(x: bounds.maxX - barSize.width - 6,
-                                        y: bounds.maxY - barSize.height - 6))
-        hoverBar.isHidden = true
+        // 换行工具条底色：macOS 26+ 原生液态玻璃（会实时折射它下面的截图）。
+        addSubview(hoverChrome)
+        let barSize = hoverChrome.frame.size
+        hoverChrome.setFrameOrigin(NSPoint(x: bounds.maxX - barSize.width - 6,
+                                           y: bounds.maxY - barSize.height - 6))
+        hoverChrome.isHidden = true
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
@@ -122,8 +117,8 @@ final class PinnedShotView: NSView {
         hoverArea = area
     }
 
-    override func mouseEntered(with event: NSEvent) { hoverBar.isHidden = false }
-    override func mouseExited(with event: NSEvent) { hoverBar.isHidden = true }
+    override func mouseEntered(with event: NSEvent) { hoverChrome.isHidden = false }
+    override func mouseExited(with event: NSEvent) { hoverChrome.isHidden = true }
 
     /// Right-click closes the pinned shot.
     override func rightMouseDown(with event: NSEvent) { onClose?() }

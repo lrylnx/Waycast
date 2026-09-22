@@ -48,6 +48,37 @@
 
 ![截图标注工具栏](docs/screenshots/screenshot-toolbar.png)
 
+### 遮罩强度
+
+进入截图态后，选区**之外**的区域会被黑色遮罩压暗，让选区「跳出来」。强度默认 **45%**，可以在 **设置 › 截图 › 选区外遮罩** 拖滑块调，也可以直接写默认值：
+
+```bash
+defaults write com.waycast.macos captureDimOpacity -float 0.6   # 0…1，0 = 完全不压暗
+```
+
+遮罩带 200 ms 缓入：第一帧与实时屏幕**逐像素一致**，之后 120 Hz 渐入，所以进场不会被闪一下。强度在会话开始时快照一次，不在重绘路径里读 UserDefaults。
+
+### 工具栏材质（液态玻璃）
+
+标注工具栏、贴图窗口的悬停工具条都走 **`NSGlassEffectView`**（macOS 26 起 AppKit 原生提供）—— 就是系统那套**液态玻璃**：实时折射并模糊它下面的画面、跟随浅色/深色外观自适应、圆角是连续圆角；macOS 27 起还开了 `effectIsInteractive`，按下有玻璃回弹。压在彩色内容上时折射最明显（对着 Dock 图标带截图，能看到图标被模糊后从工具栏里透出来）。真机前后对比见 `build/capture-before-after.png`。
+
+低于 macOS 26 时由 `Sources/Waycast/Core/LiquidGlass.swift` 的 `GlassBackdrop` 统一退回「96% 不透明底色 + 1px 高光描边 + 投影」，观感接近但不折射。**新加浮动工具条请一并走 `GlassBackdrop.wrap(_:cornerRadius:)`**，别各自设 `layer.backgroundColor`，否则新老系统会各写一套样式。
+
+> 玻璃只能折射它**下面**的画面。截图覆盖层是同一个窗口里先铺冻结帧+遮罩、再叠工具栏，所以玻璃透出的是「已经被遮罩压暗的」内容，视觉上正好是一块浮在暗幕上的玻璃，层次是对的。
+
+### 调试钩子
+
+```bash
+# 启动即进入截图态（省得按热键；F1 常被系统亮度功能占用）
+defaults write com.waycast.macos WAYCAST_AUTO_CAPTURE -bool true
+defaults write com.waycast.macos WAYCAST_AUTO_CAPTURE_DELAY -float 2.5   # 默认 1 秒
+
+# 不碰任何截图 API，直接给合成纯色帧（隔离 UI 问题时用）
+defaults write com.waycast.macos WAYCAST_NO_CAPTURE -bool true
+```
+
+两个都**用完就删**（`defaults delete com.waycast.macos WAYCAST_AUTO_CAPTURE`），否则每次开 App 都会自动弹截图。走 `defaults` 而不是环境变量是有意的：从终端直接跑可执行文件会把「屏幕录制」权限算到终端头上，截图会失败。
+
 ## 3. 贴图 (Pin)
 
 `F3` 框选一块屏幕区域，直接把它作为浮动窗口钉在屏幕最上层，适合对照参考、临时置顶信息。
@@ -156,6 +187,43 @@ Waycast 需要以下系统权限，首次启动会自动引导授权：
 > - 或执行一次：`xattr -dr com.apple.quarantine /Applications/Waycast.app`
 >
 > 之后正常双击即可。
+
+## 应用图标（macOS 26 / 27 的浮动托盘问题）
+
+### 症状
+
+在 macOS 26 Tahoe 及以后的系统上，Waycast 的图标比旁边的 App 明显小一圈，外面还套着一个灰色圆角方块。
+
+### 原因
+
+macOS 26 起苹果把 App 图标统一成「Liquid Glass」的圆角方形，并且会**检查 App 自带图标的形状**。判定为旧式图标的（传统的 `.icns`——图稿自带留白、圆角、投影），系统会把它**缩小约 20% 再垫一块灰色托盘**放在后面（社区俗称 icon jail / gray box of shame）。
+
+判断依据不是 App 的 Info.plist 写了什么，而是图标本身：Safari、Xcode、ToDesk 这些满格显示的 App，Resources 里都有 `Assets.car` + `CFBundleIconName`。
+
+### 修法
+
+用 macOS 26 的新图标格式 `.icon` 重新出一份，编译成 `Assets.car`：
+
+| 文件 | 作用 |
+| --- | --- |
+| `Resources/AppIcon.icon/` | Icon Composer 源文件（`icon.json` + `Assets/*.png` 图层） |
+| `Resources/Assets.car` | 由上面的源文件经 `actool` 编译出的资源目录（已入库） |
+| `Resources/AppIcon.icns` | 老系统（macOS 14/15）的回退图标，保持不变 |
+| `Resources/Info.plist` | 新增 `CFBundleIconName = AppIcon` |
+
+改图标：
+
+```bash
+# 用 Xcode 自带的 Icon Composer 打开 Resources/AppIcon.icon 编辑图层
+./icon.sh --preview   # 重新编译 Assets.car，并导出四种外观的预览图到 build/
+./build.sh            # build.sh 检测到素材有更新会自动重编
+```
+
+> **坑一**：`actool` 会往 `--compile` 目录里同时写一份它自己生成的 `AppIcon.icns`——只有 256px 上限。所以 `icon.sh` 先编到临时目录，只把 `Assets.car` 拿回来，绝不覆盖完整的旧版 `AppIcon.icns`。
+>
+> **坑二**：装好后 Finder / Dock / 启动台可能仍显示旧图标（图标缓存）。`touch` 一下 App 再 `killall Dock` 即可。
+>
+> **坑三**：`.icon` 是**目录**不是单文件，Finder 默认隐藏扩展名，容易和普通文件夹混淆。它是 `icon.json` + `Assets/` 两个东西。
 
 ## 系统要求
 

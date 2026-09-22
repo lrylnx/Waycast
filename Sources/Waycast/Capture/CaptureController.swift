@@ -62,9 +62,9 @@ final class IconButton: NSButton {
 
     private func updateBackground() {
         if isSelectedStyle {
-            layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.30).cgColor
+            layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.55).cgColor
         } else if hovering && isEnabled {
-            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.10).cgColor
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
         } else {
             layer?.backgroundColor = NSColor.clear.cgColor
         }
@@ -241,9 +241,7 @@ final class CaptureSelectionView: NSView {
         needsDisplay = true
     }
 
-    // No dim overlay: the user prefers the frozen frame to look identical to
-    // the live screen with zero dimming. Selection is communicated purely by
-    // the hover/crosshair UI.
+    // 选区之外的区域由 draw(_:) 里的黑色遮罩压暗（强度见下方 dimStrength）。
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -709,7 +707,8 @@ final class CaptureSelectionView: NSView {
         let stack = NSStackView(views: [])
         stack.orientation = .horizontal
         stack.spacing = 3
-        stack.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
+        // 玻璃底本身有厚度，内边距比旧色块版稍大，控件才不显得贴边。
+        stack.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
 
         // Tools
         let pen = Self.makeIconButton("pencil", "画笔") { [weak self] in self?.setTool(.pen) }
@@ -769,21 +768,10 @@ final class CaptureSelectionView: NSView {
             })
         }
 
-        stack.wantsLayer = true
-        stack.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
-        stack.layer?.cornerRadius = 8
-        // Depth: soft drop shadow below the bar plus a hairline top highlight,
-        // so the floating bar reads as raised off the screenshot.
-        stack.layer?.shadowColor = NSColor.black.cgColor
-        stack.layer?.shadowOpacity = 0.35
-        stack.layer?.shadowRadius = 9
-        stack.layer?.shadowOffset = NSSize(width: 0, height: -3)
-        stack.layer?.borderWidth = 0.5
-        stack.layer?.borderColor = NSColor.white.withAlphaComponent(0.25).cgColor
-        stack.layoutSubtreeIfNeeded()
-        let size = stack.fittingSize
-        stack.setFrameSize(size)
-        return stack
+        // 底：macOS 26+ 走原生液态玻璃（NSGlassEffectView，实时折射 + 自适应当前
+        // 外观），旧系统由 GlassBackdrop 退回半透明色块。投影在容器上，让工具条
+        // 从截图上浮起来。
+        return GlassBackdrop.wrap(stack, cornerRadius: 12)
     }
 
     private func makeSeparator() -> NSView {
@@ -856,7 +844,13 @@ final class CaptureSelectionView: NSView {
 
     // MARK: Dim fade-in
 
-    /// 0 = identical to the live screen, 1 = fully dimmed (20% black).
+    /// 选区之外区域的遮罩强度（0…1）。会话开始时从设置里快照一次，
+    /// 免得在 120 Hz 的重绘里反复读 UserDefaults。
+    /// 改强度：设置界面里的「选区外遮罩」，或
+    /// `defaults write com.waycast.macos captureDimOpacity -float 0.6`。
+    private let dimStrength: CGFloat = CGFloat(AppSettings.shared.captureDimOpacity)
+
+    /// 0 = identical to the live screen, 1 = fully dimmed (dimStrength black).
     private var dimProgress: CGFloat = 0
     private var dimTimer: Timer?
     private var dimStart: CFTimeInterval?
@@ -899,11 +893,14 @@ final class CaptureSelectionView: NSView {
         context.interpolationQuality = .high
         context.draw(frozen.image, in: bounds)
 
-        // Dim the whole screen; the hole below re-draws the untouched frame
-        // for the region being picked, so it stays bright. dimProgress fades
-        // 0→1 after the session starts (first frame stays pixel-identical to
-        // the live screen), so the arrival reads as smooth, not a flash.
-        NSColor.black.withAlphaComponent(0.2 * dimProgress).setFill()
+        // Dim everything outside the selection; the hole below re-draws the
+        // untouched frame for the region being picked, so it stays bright.
+        // Strength comes from settings (default 0.45): a strong scrim is what
+        // makes the selection read as "the part that will be captured".
+        // dimProgress fades 0→1 after the session starts (first frame stays
+        // pixel-identical to the live screen), so the arrival reads as smooth,
+        // not a flash.
+        NSColor.black.withAlphaComponent(dimStrength * dimProgress).setFill()
         bounds.fill()
 
         // The "hole": the region being picked (or the hovered window) shows the

@@ -29,6 +29,16 @@ final class AppSettings {
         set { set(hotkey: newValue, forKey: "captureHotkey") }
     }
 
+    /// 截图时选区之外区域的变暗强度，0…1（1 = 全黑）。
+    /// 默认 0.45 —— 足以让选区「跳出来」，又不至于看不清底下的内容。
+    var captureDimOpacity: Double {
+        get {
+            guard defaults.object(forKey: "captureDimOpacity") != nil else { return 0.45 }
+            return min(1, max(0, defaults.double(forKey: "captureDimOpacity")))
+        }
+        set { defaults.set(min(1, max(0, newValue)), forKey: "captureDimOpacity") }
+    }
+
     /// Max clipboard text entries retained.
     var clipboardLimit: Int {
         get {

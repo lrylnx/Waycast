@@ -55,6 +55,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // First-run guidance for required permissions.
         checkDocumentsAccess()
+
+        // 开发者钩子：启动即进入截图态（配合 WAYCAST_NO_CAPTURE 做 UI 隔离测试）。
+        //   defaults write com.waycast.macos WAYCAST_AUTO_CAPTURE -bool true
+        // 用 defaults 而非环境变量：从终端直接跑可执行文件会把 TCC 屏幕录制
+        // 权限算到终端头上，截图会失败。
+        if UserDefaults.standard.bool(forKey: "WAYCAST_AUTO_CAPTURE") {
+            let delay = UserDefaults.standard.double(forKey: "WAYCAST_AUTO_CAPTURE_DELAY")
+            DispatchQueue.main.asyncAfter(deadline: .now() + (delay > 0 ? delay : 1.0)) { [weak self] in
+                self?.captureController.start()
+            }
+        }
     }
 
     // MARK: - AppRing (radial app switcher)
