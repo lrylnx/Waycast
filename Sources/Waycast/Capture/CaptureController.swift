@@ -15,7 +15,6 @@
 //
 
 import AppKit
-import Vision
 
 // MARK: - Closure trampoline for NSButton
 
@@ -135,6 +134,26 @@ final class CapturePanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+// MARK: - Empty shell overlay (instant acknowledgement)
+
+/// 空壳覆盖层视图：**什么都不画**。
+///
+/// 为什么要它：抓帧要 30ms 左右（实测），这段时间里如果屏幕一点变化都没有，
+/// 手感就是"按了没反应"。于是按键瞬间先把这个空壳挂上去 —— 屏幕像素与实时
+/// 完全一致（什么都不画），所以**随后那次抓屏不会把覆盖层录进去**，但它让面板
+/// 变成"可见且可交互"，十字光标立刻生效。用户 0ms 就得到确认，30ms 后真正的
+/// 冻结帧 + 遮罩再无缝接上（两者像素本来就一样，看不出切换）。
+final class CaptureShellView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        // 故意什么都不画：保持屏幕像素与实时一致。
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+}
+
 // MARK: - Inline text editor
 
 /// Transparent, borderless text editor for on-screenshot typing.
@@ -189,7 +208,13 @@ final class CaptureSelectionView: NSView {
     var onCancel: (() -> Void)?
 
     let frozen: FrozenScreen
-    private(set) var phase: Phase = .idle
+    private(set) var phase: Phase = .idle {
+        didSet {
+            guard phase != oldValue else { return }
+            // 光标矩形随阶段切换：空闲/拖拽是十字，编辑态交给 applyCursor。
+            window?.invalidateCursorRects(for: self)
+        }
+    }
     private(set) var tool: Tool = .none
     private(set) var selectionRect: NSRect?
     private var annotationColor: NSColor = CaptureSelectionView.palette[0]
@@ -226,6 +251,22 @@ final class CaptureSelectionView: NSView {
     private var colorButton: IconButton?
     private var colorDotLayers: [(NSButton, NSColor)] = [] // legacy, unused
 
+    // —— 标注的悬停 / 拖动 / 滚轮缩放（选择模式下，tool == .none）——
+    /// 悬停命中的标注：画虚线提示框 + 手型光标，告诉用户"这坨可以拖"。
+    private var hoveredAnnotationIndex: Int?
+    /// 正在拖动的标注：数组下标 + 拖动前的原样 + 按下点。
+    /// 存「原样 + 位移」而不是就地累加，是为了拖动过程零漂移（每次都从原件算）。
+    private var draggingAnnotation: (index: Int, original: CaptureAnnotation, start: NSPoint)?
+
+    // —— 工具的默认粗细 / 字号（选中工具后滚轮可调）——
+    /// 原来这三处都直接用 static 常量，滚轮一来就得变成实例值；
+    /// static 值保留作默认。
+    private var activePenWidth: CGFloat = CaptureSelectionView.penWidth
+    private var activeFontSize: CGFloat = CaptureSelectionView.textFontSize
+    /// 滚轮调节时在选区顶部短暂显示的提示（"画笔 6pt"），1.2s 后自动消失。
+    private var sizeHint: String?
+    private var sizeHintWork: DispatchWorkItem?
+
     init(frame: NSRect, frozen: FrozenScreen) {
         self.frozen = frozen
         super.init(frame: frame)
@@ -256,24 +297,95 @@ final class CaptureSelectionView: NSView {
     override func shouldDelayWindowOrdering(for event: NSEvent) -> Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
+    /// 十字光标覆盖整屏：这是**零成本**的「已经进入截图态」信号，遮罩还没浮上来
+    /// 时用户也能立刻确认按键生效了。编辑态（已框选、可拖手柄）不铺光标矩形，
+    /// 让 `applyCursor` 按手柄方向设箭头/双向箭头。
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if phase != .pendingAction {
+            addCursorRect(bounds, cursor: .crosshair)
+        }
+    }
+
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { // Escape
             onCancel?()
             return
         }
+        // ⌘Z 撤销上一个标注（箭头 / 笔画 / 文字 / 矩形）。
+        // 两条路都接上：主菜单「撤销」的 key equivalent 也会派发到 `undo(_:)`，
+        // 但截图覆盖层是 nonactivatingPanel、应用多半没被激活，菜单快捷键不一定
+        // 有机会执行 —— 所以这里直接判键，不依赖菜单。
+        if Self.isUndoKeystroke(event) {
+            undo(nil)
+            return
+        }
         super.keyDown(with: event)
     }
 
+    /// 严格只认 ⌘Z：⇧⌘Z 是「重做」，不该走到撤销上。
+    /// （capsLock / fn / 小键盘这些无关位不算，见 deviceIndependentFlagsMask 的取法。）
+    private static func isUndoKeystroke(_ event: NSEvent) -> Bool {
+        guard event.charactersIgnoringModifiers?.lowercased() == "z" else { return false }
+        let significant = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        return significant == .command
+    }
+
+    /// 主菜单「撤销」的 action（target = nil，沿响应链找到这里）。
+    /// 返回给菜单用，同时也让 `keyDown` 那条路有个统一入口。
+    @objc func undo(_ sender: Any?) {
+        // 正在输入文字时，⌘Z 该撤的是刚打的字，而不是删掉上一个标注。
+        if let editor = textEditor, editor.window?.firstResponder === editor {
+            editor.undoManager?.undo()
+            return
+        }
+        undoLastAnnotation()
+    }
+
     override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
         // Cursor feedback over the selection border in editing mode.
         if phase == .pendingAction, tool == .none, let rect = selectionRect {
-            applyCursor(for: resizeEdges(at: convert(event.locationInWindow, from: nil), in: rect))
+            // 手柄优先：在边缘/角上仍然用方向光标，且不显示标注提示框。
+            if let edges = resizeEdges(at: point, in: rect) {
+                if hoveredAnnotationIndex != nil { hoveredAnnotationIndex = nil; needsDisplay = true }
+                applyCursor(for: edges)
+                return
+            }
+            // 悬停在标注上 → 高亮 + 手型光标，示意「可拖动 / 可滚轮缩放」。
+            let idx = annotationIndex(at: point)
+            if idx != hoveredAnnotationIndex {
+                hoveredAnnotationIndex = idx
+                needsDisplay = true
+            }
+            (idx != nil ? NSCursor.openHand : NSCursor.arrow).set()
             return
         }
         guard phase == .idle else { return }
         let previous = hoverHighlight
         hoverHighlight = resolveWindowHighlight()
         if hoverHighlight != previous { needsDisplay = true }
+    }
+
+    /// 滚轮：选中工具时调当前工具的粗细/字号；选择模式（无工具）下缩放
+    /// 鼠标下的那个标注 —— 画完之后嫌小/嫌大，滚一下就行，不用重画。
+    override func scrollWheel(with event: NSEvent) {
+        guard phase == .pendingAction else { return }
+        // 触控板的惯性阶段不响应：否则轻扫一下标注会自己缩个不停。
+        guard event.momentumPhase.isEmpty else { return }
+        let delta = event.scrollingDeltaY
+        guard delta != 0 else { return }
+        let magnitude = CGFloat(min(abs(delta), 3))
+        let factor: CGFloat = delta > 0 ? 1 + 0.07 * magnitude : 1 - 0.07 * magnitude
+
+        if tool != .none {
+            adjustActiveToolSize(by: factor)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        guard let idx = annotationIndex(at: point) else { return }
+        annotations[idx] = Self.scaled(annotations[idx], by: factor)
+        needsDisplay = true
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -292,28 +404,36 @@ final class CaptureSelectionView: NSView {
                 switch tool {
                 case .pen:
                     currentStroke = PenStroke(points: [clamped(point, in: rect)],
-                                              color: annotationColor, width: Self.penWidth)
+                                              color: annotationColor, width: activePenWidth)
                     needsDisplay = true
                 case .arrow:
                     currentArrow = ArrowAnnotation(start: clamped(point, in: rect),
                                                    end: clamped(point, in: rect),
-                                                   color: annotationColor, width: Self.penWidth)
+                                                   color: annotationColor, width: activePenWidth)
                     needsDisplay = true
                 case .roundedRect:
                     let p = clamped(point, in: rect)
                     roundedRectStart = p
                     currentRoundedRect = RoundedRectAnnotation(rect: NSRect(origin: p, size: .zero),
                                                                color: annotationColor,
-                                                               width: Self.penWidth)
+                                                               width: activePenWidth)
                     needsDisplay = true
                 case .text:
                     beginTextEditor(at: point, in: rect)
                 case .none:
-                    // No tool active: drag repositions the selection
-                    // (annotations travel with it).
-                    moveOrigin = point
-                    preMoveRect = rect
-                    preMoveAnnotations = annotations
+                    // No tool active. Grab an existing annotation first — pressing
+                    // one lets you DRAG it to a better spot (the whole point of
+                    // this mode besides moving/resizing the selection itself).
+                    if let idx = annotationIndex(at: point) {
+                        draggingAnnotation = (idx, annotations[idx], point)
+                        NSCursor.closedHand.set()
+                    } else {
+                        // Otherwise drag repositions the selection (annotations
+                        // travel with it).
+                        moveOrigin = point
+                        preMoveRect = rect
+                        preMoveAnnotations = annotations
+                    }
                 }
                 return
             }
@@ -341,6 +461,14 @@ final class CaptureSelectionView: NSView {
             let newRect = resizedRect(state.original, edges: state.edges, to: point)
             selectionRect = newRect
             moveActionBar(below: newRect)
+            needsDisplay = true
+            return
+        }
+
+        // Dragging a single annotation to a better spot.
+        if let drag = draggingAnnotation, phase == .pendingAction {
+            let d = NSPoint(x: point.x - drag.start.x, y: point.y - drag.start.y)
+            annotations[drag.index] = Self.translated([drag.original], by: d)[0]
             needsDisplay = true
             return
         }
@@ -395,6 +523,15 @@ final class CaptureSelectionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        // Finish dragging a single annotation.
+        if draggingAnnotation != nil {
+            draggingAnnotation = nil
+            hoveredAnnotationIndex = nil   // 交给 mouseMoved 重算
+            NSCursor.arrow.set()
+            needsDisplay = true
+            return
+        }
+
         // Finish a resize drag.
         if resizeState != nil {
             resizeState = nil
@@ -524,7 +661,7 @@ final class CaptureSelectionView: NSView {
         let editor = AnnotationTextView(frame: NSRect(x: point.x, y: point.y - 28,
                                                       width: width, height: 28))
         editor.anchorTop = point
-        editor.font = NSFont.systemFont(ofSize: Self.textFontSize, weight: .medium)
+        editor.font = NSFont.systemFont(ofSize: activeFontSize, weight: .medium)
         editor.textColor = annotationColor
         editor.drawsBackground = false
         editor.isRichText = false
@@ -551,11 +688,14 @@ final class CaptureSelectionView: NSView {
             usedHeight = layout.usedRect(for: container).height
         }
         let origin = editor.anchorTop
+        // 编辑期间滚轮可能改了 activeFontSize —— 落盘要用**编辑器自己的**字号，
+        // 不然显示和保存会不一致。
+        let fontSize = editor.font?.pointSize ?? activeFontSize
         discardTextEditor()
         guard !text.isEmpty else { return }
         let annotation = TextAnnotation(point: NSPoint(x: origin.x, y: origin.y - usedHeight),
                                         text: editor.string.trimmingCharacters(in: .newlines),
-                                        fontSize: Self.textFontSize, color: annotationColor)
+                                        fontSize: fontSize, color: annotationColor)
         annotations.append(.text(annotation))
         refreshUndoState()
         needsDisplay = true
@@ -681,12 +821,79 @@ final class CaptureSelectionView: NSView {
         return button
     }
 
+    /// OCR 按钮的图标：圆角框里写「OCR」三个字。
+    ///
+    /// 为什么不用 SF Symbol：`doc.text.viewfinder` 只是个「取景框 + 文本」的抽象图形，
+    /// 一眼看不出是文字识别；工具栏上直接写 OCR 最直白。这和「T」（文字工具）按钮是
+    /// 同一套做法 —— 那个也得自绘，因为 SF Symbol 的 `textformat.abc` 在中文系统上
+    /// 会渲染成「甲乙丙」。
+    ///
+    /// 尺寸按**实际字体度量**定，不是拍脑袋：
+    ///
+    /// - 三字母的难点在宽度。想让框窄下来又不把字压成糊，用系统字体的 **condensed
+    ///   宽度特性**（`withSymbolicTraits(.condensed)`）：字形不变形、字高不缩水，
+    ///   只横向收窄 —— 7pt Bold 的 `"OCR"` 从 15.04pt 收到 12.53pt（−17%）。
+    ///   再用 kern −0.9 收到 **11.03pt**（`NSAttributedString.size()` 量的）。
+    /// - 框 **14×13**、描边 1pt → 内空 12pt，左右各留 ~0.5pt 边距。
+    /// - 14pt 的墨迹宽度和工具栏邻居（实测 9–13pt：画笔 12 / 箭头 9 / 撤销 13 /
+    ///   复制 13）是同一量级；旧版 22.6pt 明显比别人胖一圈（用户实测反馈）。
+    /// - 高度 13 落在邻居的 9–16pt 中间，不会显得突兀。
+    ///
+    /// `draw(at:)` 的行盒中心恰好等于字冠中心（SF 字体 ascender ≈ capHeight +
+    /// |descender|），所以按行盒居中就是视觉居中。
+    ///
+    /// `height` 是给不同工具条用的：截图工具栏（28pt 按钮）用 13，贴图的小工具条
+    /// （24pt 按钮）也用 13 —— 和旁边 12pt 的 SF Symbol 视觉重量对齐。
+    static func ocrGlyphIcon(height: CGFloat = 13) -> NSImage {
+        let design = NSSize(width: 14, height: 13)      // 设计稿尺寸，按 height 等比缩放
+        let k = height / design.height
+        let canvas = NSSize(width: design.width * k, height: height)
+        let image = NSImage(size: canvas, flipped: false) { rect in
+            guard let ctx = NSGraphicsContext.current else { return false }
+            ctx.saveGraphicsState()
+            let t = NSAffineTransform()
+            t.scale(by: k)
+            t.concat()
+
+            let stroke: CGFloat = 1.0
+            let box = NSRect(origin: .zero, size: design).insetBy(dx: stroke / 2, dy: stroke / 2)
+            let path = NSBezierPath(roundedRect: box, xRadius: 3.5, yRadius: 3.5)
+            path.lineWidth = stroke
+            NSColor.black.setStroke()
+            path.stroke()
+
+            let base = NSFont.systemFont(ofSize: 7, weight: .bold)
+            let condensed = base.fontDescriptor.withSymbolicTraits(.condensed)
+            let font = NSFont(descriptor: condensed, size: 7) ?? base
+            let attributed = NSAttributedString(string: "OCR", attributes: [
+                .font: font,
+                .foregroundColor: NSColor.black,
+                .kern: -0.9,
+            ])
+            let size = attributed.size()
+            attributed.draw(at: NSPoint(x: (design.width - size.width) / 2,
+                                        y: (design.height - size.height) / 2))
+            ctx.restoreGraphicsState()
+            return true
+        }
+        image.isTemplate = true   // 颜色交给 contentTintColor，和 SF Symbol 按钮一致
+        return image
+    }
+
     private static func makeIconButton(_ symbol: String, _ name: String,
                                        tint: NSColor = .labelColor,
                                        _ handler: @escaping () -> Void) -> IconButton {
-        let button = IconButton(frame: .zero)
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: name)?
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: name)?
             .withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
+        return makeImageButton(image ?? NSImage(), name, tint: tint, handler)
+    }
+
+    /// 自绘图标版的按钮（OCR 用；其余按钮走 SF Symbol）。
+    private static func makeImageButton(_ image: NSImage, _ name: String,
+                                        tint: NSColor = .labelColor,
+                                        _ handler: @escaping () -> Void) -> IconButton {
+        let button = IconButton(frame: .zero)
+        button.image = image
         button.imageScaling = .scaleProportionallyDown
         button.isBordered = false
         button.toolTip = name
@@ -760,8 +967,11 @@ final class CaptureSelectionView: NSView {
         stack.addArrangedSubview(Self.makeIconButton("xmark", "取消", tint: .systemRed) { [weak self] in
             self?.onCancel?()
         })
-        for (symbol, name, action) in [("doc.text.viewfinder", "OCR 文字识别", "ocr"),
-                                       ("square.and.arrow.down", "保存", "save"),
+        // OCR 用自绘图标（框里写 OCR），比 SF Symbol 的取景框图形更一眼可辨。
+        stack.addArrangedSubview(Self.makeImageButton(Self.ocrGlyphIcon(), "OCR 文字识别") { [weak self] in
+            self?.onFinalAction?("ocr")
+        })
+        for (symbol, name, action) in [("square.and.arrow.down", "保存", "save"),
                                        ("doc.on.doc", "复制", "copy")] {
             stack.addArrangedSubview(Self.makeIconButton(symbol, name) { [weak self] in
                 self?.onFinalAction?(action)
@@ -795,6 +1005,34 @@ final class CaptureSelectionView: NSView {
         undoButton?.contentTintColor = hasContent ? .labelColor : .secondaryLabelColor
         undoButton?.layer?.opacity = hasContent ? 1 : 0.75
     }
+
+    // MARK: - 开发者验证钩子（默认关闭，见 AppDelegate 顶部的 defaults 说明）
+    // 「框选」这一步必须人手完成，自动化看不到工具条 —— 用这个钩子直接摆一个假选区，
+    // 配合 WAYCAST_NO_CAPTURE（屏幕内容换成纯灰）就能无人值守地核对工具条与撤销。
+    func debugSelect(_ rect: NSRect, annotate: Bool) {
+        selectionRect = rect
+        phase = .pendingAction
+        if annotate {
+            // 一笔曲线 + 一个箭头：正好覆盖「画笔」与「箭头」两类标注。
+            let pts = stride(from: 0, through: 10, by: 1).map { i -> NSPoint in
+                let t = CGFloat(i) / 10
+                return NSPoint(x: rect.minX + 30 + t * 160,
+                               y: rect.minY + 40 + sin(t * .pi) * 50)
+            }
+            annotations = [
+                .stroke(PenStroke(points: pts, color: .systemRed, width: Self.penWidth)),
+                .arrow(ArrowAnnotation(start: NSPoint(x: rect.minX + 220, y: rect.minY + 50),
+                                       end: NSPoint(x: rect.minX + 330, y: rect.minY + 130),
+                                       color: .systemRed, width: Self.penWidth)),
+            ]
+        }
+        needsDisplay = true
+        refreshUndoState()
+        showActionBar(below: rect)
+    }
+
+    /// 给外部（控制器）读一下当前标注数，用于验证撤销是否生效。
+    var debugAnnotationCount: Int { annotations.count }
 
     // MARK: Color picker
 
@@ -855,24 +1093,32 @@ final class CaptureSelectionView: NSView {
     private var dimTimer: Timer?
     private var dimStart: CFTimeInterval?
 
-    /// Called right after the panel becomes visible. The first frame renders
-    /// with dimProgress 0 (pixel-identical to the live screen), then the dim
-    /// fades in over 200 ms with an ease-out curve at 120 Hz.
+    /// Called right after the panel becomes visible.
+    ///
+    /// 这里以前是「首帧 dimProgress = 0（与实时屏幕逐像素一致）→ 200ms / 120Hz 渐显」。
+    /// 想法是"别闪"，代价却是**感知延迟**：屏幕内容静止时，冻结帧和实时画面一模一样，
+    /// 用户看不出任何变化，只能等遮罩慢慢浮上来 —— 手感就成了"按了没反应"。
+    /// 现在首帧直接带 30% 遮罩，再用 120ms / 60Hz 收尾：一进来就能看见，
+    /// 又不会亮暗跳变。顺带把每秒 120 次的全屏重绘降到 60 次。
     func startDimFade() {
         dimTimer?.invalidate()
-        dimProgress = 0
+        dimProgress = Self.dimHeadStart
         dimStart = CACurrentMediaTime()
-        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.stepDimFade() }
         }
         RunLoop.main.add(timer, forMode: .common)
         dimTimer = timer
     }
 
+    private static let dimHeadStart: CGFloat = 0.3
+    private static let dimFadeDuration: CFTimeInterval = 0.12
+
     private func stepDimFade() {
         guard let start = dimStart else { return }
-        let t = min(1, (CACurrentMediaTime() - start) / 0.2)
-        dimProgress = 1 - pow(1 - t, 3) // ease-out cubic
+        let t = min(1, (CACurrentMediaTime() - start) / Self.dimFadeDuration)
+        let eased = 1 - pow(1 - t, 3) // ease-out cubic
+        dimProgress = Self.dimHeadStart + (1 - Self.dimHeadStart) * eased
         needsDisplay = true
         if t >= 1 {
             dimTimer?.invalidate()
@@ -938,7 +1184,37 @@ final class CaptureSelectionView: NSView {
         if let stroke = currentStroke { drawStroke(stroke) }
         if let arrow = currentArrow { drawArrow(arrow) }
         if let rr = currentRoundedRect { drawRoundedRect(rr) }
+        // 悬停标注的提示框：黑+白双层虚线，截图底色深浅都看得见。
+        if phase == .pendingAction, tool == .none, draggingAnnotation == nil,
+           let idx = hoveredAnnotationIndex, annotations.indices.contains(idx) {
+            let b = annotationBounds(annotations[idx]).insetBy(dx: -5, dy: -5)
+            let dashed = NSBezierPath(roundedRect: b, xRadius: 6, yRadius: 6)
+            dashed.setLineDash([4, 3], count: 2, phase: 0)
+            dashed.lineWidth = 2.5
+            NSColor.black.withAlphaComponent(0.55).setStroke()
+            dashed.stroke()
+            let inner = NSBezierPath(roundedRect: b, xRadius: 6, yRadius: 6)
+            inner.setLineDash([4, 3], count: 2, phase: 0)
+            inner.lineWidth = 1
+            NSColor.white.withAlphaComponent(0.9).setStroke()
+            inner.stroke()
+        }
         context.restoreGState()
+
+        // 滚轮调粗细/字号时的短暂提示（画在选区顶部内侧，不挡工具栏）。
+        if let hint = sizeHint, let rect = selectionRect {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                .foregroundColor: NSColor.white
+            ]
+            let textSize = (hint as NSString).size(withAttributes: attrs)
+            let box = NSRect(x: rect.midX - textSize.width / 2 - 9,
+                             y: rect.maxY - 26,
+                             width: textSize.width + 18, height: 19)
+            NSColor.black.withAlphaComponent(0.6).setFill()
+            NSBezierPath(roundedRect: box, xRadius: 9.5, yRadius: 9.5).fill()
+            hint.draw(at: NSPoint(x: box.minX + 9, y: box.minY + 3.5), withAttributes: attrs)
+        }
     }
 
     private func drawAnnotations() {
@@ -1052,6 +1328,122 @@ final class CaptureSelectionView: NSView {
 
     // MARK: Private
 
+    // MARK: Annotation hit-testing / zoom
+
+    /// 标注的命中范围（外扩到含线宽，否则细线几乎点不中）。文字按当前字体的
+    /// 实际排版尺寸算。
+    private func annotationBounds(_ annotation: CaptureAnnotation) -> NSRect {
+        switch annotation {
+        case .stroke(let s):
+            guard let first = s.points.first else { return .zero }
+            var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
+            for p in s.points.dropFirst() {
+                minX = min(minX, p.x); maxX = max(maxX, p.x)
+                minY = min(minY, p.y); maxY = max(maxY, p.y)
+            }
+            let pad = s.width / 2 + 3
+            return NSRect(x: minX - pad, y: minY - pad,
+                          width: (maxX - minX) + pad * 2, height: (maxY - minY) + pad * 2)
+        case .text(let t):
+            let size = (t.text as NSString).size(withAttributes: [
+                .font: NSFont.systemFont(ofSize: t.fontSize, weight: .medium)])
+            return NSRect(x: t.point.x, y: t.point.y, width: size.width, height: size.height)
+        case .arrow(let a):
+            let head = max(11, a.width * 3.2)
+            let pad = a.width + head
+            return NSRect(x: min(a.start.x, a.end.x) - pad, y: min(a.start.y, a.end.y) - pad,
+                          width: abs(a.end.x - a.start.x) + pad * 2,
+                          height: abs(a.end.y - a.start.y) + pad * 2)
+        case .roundedRect(let rr):
+            let pad = rr.width / 2 + 3
+            return rr.rect.insetBy(dx: -pad, dy: -pad)
+        }
+    }
+
+    /// 鼠标下的标注，后画的优先（视觉上在最上面）。
+    private func annotationIndex(at point: NSPoint) -> Int? {
+        for i in annotations.indices.reversed()
+        where annotationBounds(annotations[i]).contains(point) {
+            return i
+        }
+        return nil
+    }
+
+    /// 以元素自身中心为锚缩放（文字以落点为锚 —— 位置归拖动管，缩放只管大小）。
+    /// 线条粗细/字号跟着一起变，看起来才是「同一个标记变大了」而不是重新画。
+    private static func scaled(_ annotation: CaptureAnnotation, by f: CGFloat) -> CaptureAnnotation {
+        func scalePoint(_ p: NSPoint, around c: NSPoint) -> NSPoint {
+            NSPoint(x: c.x + (p.x - c.x) * f, y: c.y + (p.y - c.y) * f)
+        }
+        func clampWidth(_ w: CGFloat) -> CGFloat { min(max(w * f, 1.5), 48) }
+        switch annotation {
+        case .stroke(var s):
+            var center = NSPoint.zero
+            if let first = s.points.first {
+                var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
+                for p in s.points {
+                    minX = min(minX, p.x); maxX = max(maxX, p.x)
+                    minY = min(minY, p.y); maxY = max(maxY, p.y)
+                }
+                center = NSPoint(x: (minX + maxX) / 2, y: (minY + maxY) / 2)
+            }
+            s.points = s.points.map { scalePoint($0, around: center) }
+            s.width = clampWidth(s.width)
+            return .stroke(s)
+        case .text(var t):
+            t.fontSize = min(max(t.fontSize * f, 9), 200)
+            return .text(t)
+        case .arrow(var a):
+            let center = NSPoint(x: (a.start.x + a.end.x) / 2, y: (a.start.y + a.end.y) / 2)
+            a.start = scalePoint(a.start, around: center)
+            a.end = scalePoint(a.end, around: center)
+            a.width = clampWidth(a.width)
+            return .arrow(a)
+        case .roundedRect(var rr):
+            let center = NSPoint(x: rr.rect.midX, y: rr.rect.midY)
+            rr.rect = NSRect(x: center.x - rr.rect.width * f / 2,
+                             y: center.y - rr.rect.height * f / 2,
+                             width: max(rr.rect.width * f, 4),
+                             height: max(rr.rect.height * f, 4))
+            rr.width = clampWidth(rr.width)
+            return .roundedRect(rr)
+        }
+    }
+
+    /// 工具激活时滚轮调「下一个标注」的默认粗细 / 字号。
+    private func adjustActiveToolSize(by factor: CGFloat) {
+        switch tool {
+        case .pen:
+            activePenWidth = min(max(activePenWidth * factor, 2), 40)
+            sizeHint = "画笔 \(Int(activePenWidth.rounded()))pt"
+        case .arrow:
+            activePenWidth = min(max(activePenWidth * factor, 2), 40)
+            sizeHint = "箭头 \(Int(activePenWidth.rounded()))pt"
+        case .roundedRect:
+            activePenWidth = min(max(activePenWidth * factor, 2), 40)
+            sizeHint = "矩形 \(Int(activePenWidth.rounded()))pt"
+        case .text:
+            activeFontSize = min(max(activeFontSize * factor, 10), 120)
+            sizeHint = "文字 \(Int(activeFontSize.rounded()))pt"
+        case .none:
+            return
+        }
+        scheduleSizeHintDismiss()
+        needsDisplay = true
+    }
+
+    private func scheduleSizeHintDismiss() {
+        sizeHintWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.sizeHint = nil
+                self?.needsDisplay = true
+            }
+        }
+        sizeHintWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: work)
+    }
+
     // MARK: Resize handles
 
     /// Which rect edges (if any) sit within `handleTolerance` of the point.
@@ -1149,6 +1541,9 @@ final class CaptureController: NSObject {
     private var pendingRegion: (view: CaptureSelectionView, rect: NSRect)?
     private var keyRetryWork: DispatchWorkItem?
 
+    /// 覆盖层真正显形时回调一次（诊断/测延迟用；生产路径为 nil）。
+    var onPresented: (() -> Void)?
+
     /// Panels persist across sessions, ordered front but fully transparent
     /// (alpha 0) and mouse-transparent while idle. macOS 26 plays a zoom
     /// animation whenever a NEW window is ordered front — a fullscreen overlay
@@ -1175,27 +1570,100 @@ final class CaptureController: NSObject {
         }
     }
 
-    var isRunning: Bool { !panels.isEmpty }
+    var isRunning: Bool { !panels.isEmpty || shellActive }
+
+    /// 空壳已经挂上、还在等抓帧的窗口期（用来挡住这期间的第二下按键）。
+    private var shellActive = false
+
+    /// 诊断开关：关掉空壳做 A/B（默认开）。
+    var shellEnabled = true
+
+    // MARK: - 诊断埋点（只在 WAYCAST_CAPTURE_BENCH 打开时记录，开销可忽略）
+
+    /// 本次会话各阶段相对 `start()` 的毫秒数。用来回答"按完键之后时间花在哪"。
+    private(set) var phaseMarks: [(String, Double)] = []
+    private static let benchOn = UserDefaults.standard.bool(forKey: "WAYCAST_CAPTURE_BENCH")
+    private var sessionT0: CFTimeInterval = 0
+
+    private func mark(_ name: String) {
+        guard Self.benchOn else { return }
+        phaseMarks.append((name, (CACurrentMediaTime() - sessionT0) * 1000))
+    }
+
+    /// 开发者钩子：抓完帧后直接摆一个假选区（居中，占屏幕 fraction），可选预置两个
+    /// 标注。框选必须人手完成，自动化验证（截图核对工具栏外观 / 验 ⌘Z）看不到工具条。
+    ///   defaults write com.waycast.macos WAYCAST_AUTO_CAPTURE_SELECT -float 0.45
+    ///   defaults write com.waycast.macos WAYCAST_AUTO_ANNOTATE -bool true
+    func debugSelect(fraction: CGFloat, annotate: Bool) {
+        guard let view = views.first else { return }
+        let b = view.bounds
+        view.debugSelect(NSRect(x: b.midX - b.width * fraction / 2,
+                                y: b.midY - b.height * fraction / 2,
+                                width: b.width * fraction, height: b.height * fraction),
+                         annotate: annotate)
+    }
+
+    /// 当前有多少个标注（验证撤销用）。
+    var debugAnnotationCount: Int { views.first?.debugAnnotationCount ?? -1 }
+
+    /// 覆盖层的当前第一响应者（验证键盘链路用）。
+    var debugFirstResponder: NSResponder? {
+        panels.first(where: { $0.isKeyWindow })?.firstResponder
+    }
+
+    /// 把当前标注数追加写一行到文件（GUI app 的 stdout 看不到，只能写文件）。
+    func debugLog(_ line: String, to path: String) {
+        let previous = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        try? (previous + line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    }
 
     func start() {
+        sessionT0 = CACurrentMediaTime()
+        phaseMarks = []
+        mark("start() 进入")
         guard !isRunning else { return }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
             Toast.show("截图需要「屏幕录制」权限，请在弹窗中允许")
             return
         }
+        presentShells()
+        mark("空壳显形（十字光标已生效）")
         Task { await runSession() }
     }
 
+    /// 挂空壳：不画像素、不压暗，纯粹为了立刻把光标换成十字并让面板可交互。
+    private func presentShells() {
+        guard shellEnabled else { return }
+        for entry in panelPool {
+            let shell = CaptureShellView(frame: NSRect(origin: .zero, size: entry.frame.size))
+            entry.panel.contentView = shell
+            entry.panel.ignoresMouseEvents = false
+            entry.panel.alphaValue = 1
+            shell.window?.invalidateCursorRects(for: shell)
+        }
+        shellActive = true
+        NSCursor.crosshair.set()
+    }
+
+    /// 仅供诊断：只挂空壳、不启动会话（用来验证空壳不污染抓帧）。
+    func debugPresentShellsOnly() { presentShells() }
+
     private func runSession() async {
+        mark("runSession 开始（Task 调度）")
         let screens: [FrozenScreen]
         do {
             screens = try await FrozenCapture.captureAllScreens()
         } catch {
             Toast.show("截图失败：无法捕获屏幕（权限或显示状态变化）")
+            teardown()
             return
         }
-        guard !screens.isEmpty else { return }
+        mark("抓帧完成")
+        guard !screens.isEmpty else {
+            teardown()
+            return
+        }
 
         for screen in screens {
             let view = CaptureSelectionView(frame: NSRect(origin: .zero, size: screen.frame.size), frozen: screen)
@@ -1219,20 +1687,29 @@ final class CaptureController: NSObject {
             panels.append(panel)
             views.append(view)
         }
+        mark("视图/面板就绪")
 
         // Flip visibility in place — no window open event, no animation.
         for panel in panels {
             panel.ignoresMouseEvents = false
             panel.alphaValue = 1
         }
+        // 立刻把光标换成十字：这是零成本的"我按到了"信号，遮罩还没浮上来时
+        // 用户也能马上确认截图态已进入。
+        NSCursor.crosshair.set()
         for view in views { view.startDimFade() }
+        mark("已显形（alpha 翻好）")
+
         // Anchor keyboard focus on the panel under the mouse (Esc needs the
         // responder chain).
         let mouse = NSEvent.mouseLocation
         let anchor = panels.first { $0.frame.contains(mouse) } ?? panels.first
         anchor?.makeKeyAndOrderFront(nil)
+        mark("取到键盘焦点")
         if let view = anchor?.contentView { anchor?.makeFirstResponder(view) }
+        mark("第一响应者就位")
         armKeyWindowWatchdog(for: anchor)
+        onPresented?()
     }
 
     /// The hotkey can fire while a status-menu tracking loop still owns focus,
@@ -1253,7 +1730,8 @@ final class CaptureController: NSObject {
             self.armKeyWindowWatchdog(for: panel, attempts: attempts - 1)
         }
         keyRetryWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        // 60ms 一次（原来 150ms）：首次重试越快，偶发的"按键后卡一下"越短。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
     }
 
     // MARK: Decisions
@@ -1278,14 +1756,9 @@ final class CaptureController: NSObject {
             guard let pinRect else { return }
             PinnedShotController.shared.pin(image: image, screenRect: pinRect)
         case "ocr":
-            Task { @MainActor in
-                let text = await Self.recognizeText(in: image)
-                guard !text.isEmpty else {
-                    Toast.show("未识别到文字")
-                    return
-                }
-                OCRResultWindowController.shared.show(text: text, near: anchorFrame)
-            }
+            // 识别与展示都交给结果窗口 —— 它会先显示「正在识别…」，识别完填充，
+            // 并且允许当场换语言/排版重算。
+            OcrResultWindowController.shared.show(image: image, sourceName: "截图", near: anchorFrame)
         case "save":
             let name = "截图 \(Self.dateFormatter.string(from: Date())).png"
             ImageSaveSupport.saveWithPanel(image, defaultName: name)
@@ -1306,12 +1779,7 @@ final class CaptureController: NSObject {
             do {
                 let image = try await FrozenCapture.captureWindow(windowID: windowID, ownerPID: ownerPID)
                 if ocr {
-                    let text = await Self.recognizeText(in: image)
-                    guard !text.isEmpty else {
-                        Toast.show("未识别到文字")
-                        return
-                    }
-                    OCRResultWindowController.shared.show(text: text, near: anchorFrame)
+                    OcrResultWindowController.shared.show(image: image, sourceName: "窗口截图", near: anchorFrame)
                 } else {
                     Self.copyImage(image)
                 }
@@ -1327,6 +1795,7 @@ final class CaptureController: NSObject {
         keyRetryWork?.cancel()
         keyRetryWork = nil
         pendingRegion = nil
+        shellActive = false
         for view in views {
             view.onFinalAction = nil
             view.onWindowClicked = nil
@@ -1334,13 +1803,16 @@ final class CaptureController: NSObject {
             view.stopDimFade()
             view.dismissActionBar()
         }
-        for panel in panels {
-            panel.delegate = nil
+        // 对整个池复位，而不是只复位本次 panels —— 空壳阶段（已经显形、
+        // 但抓帧还没回来）失败时，panels 还是空的，只复位 panels 会把
+        // "透明但吃鼠标"的覆盖层留在屏幕上，把所有点击全吞掉。
+        for entry in panelPool {
+            entry.panel.delegate = nil
             // Hide in place: keep the window ordered front but transparent and
             // mouse-transparent. Never orderOut — re-fronting a window plays
             // Tahoe's zoom animation again.
-            panel.ignoresMouseEvents = true
-            panel.alphaValue = 0
+            entry.panel.ignoresMouseEvents = true
+            entry.panel.alphaValue = 0
         }
         panels.removeAll()
         views.removeAll()
@@ -1356,134 +1828,11 @@ final class CaptureController: NSObject {
         Toast.show("已复制到剪贴板")
     }
 
-    /// Vision OCR (Chinese + English), background queue, main-thread result.
-    /// Internal: also used by the pinned-shot window's OCR button.
-    static func recognizeText(in image: CGImage) async -> String {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let request = VNRecognizeTextRequest()
-                request.recognitionLevel = .accurate
-                request.usesLanguageCorrection = true
-                var langs = ["zh-Hans", "zh-Hant", "en-US"]
-                if let supported = try? request.supportedRecognitionLanguages() {
-                    let filtered = langs.filter { supported.contains($0) }
-                    langs = filtered.isEmpty ? Array(supported.prefix(2)) : filtered
-                }
-                request.recognitionLanguages = langs
-                let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
-                do {
-                    try handler.perform([request])
-                    let text = (request.results ?? [])
-                        .compactMap { $0.topCandidates(1).first?.string }
-                        .joined(separator: "\n")
-                    continuation.resume(returning: text)
-                } catch {
-                    NSLog("Waycast OCR failed: \(error)")
-                    continuation.resume(returning: "")
-                }
-            }
-        }
-    }
-
     private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH.mm.ss"
         return f
     }()
-}
-
-// MARK: - OCR result window
-
-/// Floating window showing recognized text in an editable, selectable box.
-@MainActor
-final class OCRResultWindowController: NSObject {
-    static let shared = OCRResultWindowController()
-
-    private var window: NSWindow?
-    private var textView: NSTextView?
-
-    func show(text: String, near screenFrame: NSRect) {
-        close()
-
-        let contentSize = NSSize(width: 460, height: 380)
-        let win = NSWindow(contentRect: NSRect(origin: .zero, size: contentSize),
-                           styleMask: [.titled, .closable, .resizable],
-                           backing: .buffered, defer: false)
-        win.title = "OCR 识别结果"
-        win.level = .floating
-        win.isReleasedWhenClosed = false
-        win.minSize = NSSize(width: 320, height: 220)
-
-        let content = NSView(frame: NSRect(origin: .zero, size: contentSize))
-
-        // Editable text area.
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 34,
-                                                width: contentSize.width,
-                                                height: contentSize.height - 34))
-        scroll.autoresizingMask = [.width, .height]
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .noBorder
-        let editor = NSTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
-        editor.isEditable = true
-        editor.isSelectable = true
-        editor.isRichText = false
-        editor.font = NSFont.systemFont(ofSize: 13)
-        editor.textColor = .labelColor
-        editor.drawsBackground = true
-        editor.autoresizingMask = [.width]
-        editor.isVerticallyResizable = true
-        editor.isHorizontallyResizable = false
-        editor.textContainer?.widthTracksTextView = true
-        editor.string = text
-        scroll.documentView = editor
-        content.addSubview(scroll)
-
-        // Bottom bar: copy everything / char count.
-        let copyButton = NSButton(title: "复制全部", target: self, action: #selector(copyAll))
-        copyButton.bezelStyle = .rounded
-        copyButton.controlSize = .small
-        copyButton.frame = NSRect(x: 12, y: 5, width: 84, height: 24)
-        copyButton.autoresizingMask = [.maxXMargin]
-        content.addSubview(copyButton)
-
-        let countLabel = NSTextField(labelWithString: "\(text.count) 字符")
-        countLabel.font = NSFont.systemFont(ofSize: 11)
-        countLabel.textColor = .secondaryLabelColor
-        countLabel.sizeToFit()
-        countLabel.frame.origin = NSPoint(x: contentSize.width - countLabel.frame.width - 14, y: 10)
-        countLabel.autoresizingMask = [.minXMargin]
-        content.addSubview(countLabel)
-
-        win.contentView = content
-
-        // Place over the captured area (clamped to the nearest screen).
-        let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: screenFrame.midX, y: screenFrame.midY)) }
-            ?? NSScreen.main
-        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        var origin = NSPoint(x: (screenFrame.isEmpty ? visible.midX : screenFrame.midX) - contentSize.width / 2,
-                             y: (screenFrame.isEmpty ? visible.midY : screenFrame.midY) - contentSize.height / 2)
-        origin.x = max(visible.minX + 8, min(origin.x, visible.maxX - contentSize.width - 8))
-        origin.y = max(visible.minY + 8, min(origin.y, visible.maxY - contentSize.height - 8))
-        win.setFrameOrigin(origin)
-
-        window = win
-        textView = editor
-        win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    func close() {
-        window?.orderOut(nil)
-        window = nil
-        textView = nil
-    }
-
-    @objc private func copyAll() {
-        guard let text = textView?.string, !text.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        Toast.show("已复制到剪贴板")
-    }
 }
 
 // MARK: - Save support

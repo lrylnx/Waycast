@@ -25,8 +25,13 @@ final class SearchViewModel: ObservableObject {
 
     var allResults: [SearchItem] { appResults + fileResults }
 
-    func reset() {
-        query = ""
+    /// 清理面板状态。
+    ///
+    /// `keepingQuery: true` 用于 hide/show —— **保留输入框里的词**：误触呼出、
+    /// 点外面误关之后，下次呼出还在，不用重新打一遍。用户手动删空过的词
+    /// 自然就是空，无需特殊处理。列表仍然收起（结果由 show 时重新搜索刷新）。
+    func reset(keepingQuery: Bool = false) {
+        if !keepingQuery { query = "" }
         appResults = []
         fileResults = []
         selectedIndex = 0

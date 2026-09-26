@@ -13,14 +13,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) lazy var clipboardController = ClipboardController()
     private(set) lazy var captureController = CaptureController()
 
-    private var hotkeyManager: HotkeyManager!
+    private(set) var hotkeyManager: HotkeyManager!
     /// 状态栏图标四个互斥选项（默认闪电 / 内存水位 / 网速 / CPU 温度）。
     private var statusIconItems: [StatusIconMode: NSMenuItem] = [:]
+    /// 菜单里那三项要跟着快捷键配置走的条目（改快捷键后只更新它们的标题）。
+    private var searchMenuItem: NSMenuItem?
+    private var captureMenuItem: NSMenuItem?
+    private var ocrClipboardMenuItem: NSMenuItem?
+    /// 菜单里的「接管裸 F 键（keyDown 通道）」开关（勾选态跟着 `settings.topRowKeyDownChannel` 走）。
+    private var topRowMenuItem: NSMenuItem?
     /// 菜单打开期间以 1Hz 刷新这几项的实时读数；菜单一关就销毁。
     private var statusIconReadingsTimer: Timer?
     /// Self-heals the AppRing event tap (the system disables it after sleep /
     /// login, or until Accessibility is granted).
     private var appRingTapTimer: Timer?
+    /// 显示器拓扑变化通知的持有者（抓屏显示器列表缓存要跟着失效）。
+    private var screenParamsObserver: NSObjectProtocol?
     /// True while the status-bar menu is open. A hotkey pressed during menu
     /// tracking runs its handler inside (or right after) the menu's nested
     /// event loop, where the screenshot overlay can't become key — the old
@@ -43,6 +51,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Prewarm ScreenCaptureKit so the first frozen capture is fast (Mio-style).
         Task { await FrozenCapture.prewarm() }
+
+        // 插拔显示器 / 改分辨率后，抓屏用的显示器列表缓存必须作废。
+        screenParamsObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { _ in
+            FrozenCapture.invalidateDisplayCache()
+        }
+
+        // 预热文字识别模型：Vision 按语言加载，首次要十几秒。提前吃掉它，
+        // 用户第一次点「提取文字」就不用干等。
+        OcrService.warmUp(language: settings.ocrLanguage)
 
         // Warm the capture overlay panel pool now (invisible windows) so the
         // first F1 never orders a new window front — macOS 26 zoom-animates
@@ -84,6 +104,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.searchController.debugSetQuery(query)
                     }
                 }
+            }
+        }
+
+        // 开发者钩子：启动即对某个图片文件跑一次 OCR，把结果写日志（自动化验证用，
+        // 不需要屏幕录制权限）。
+        //   defaults write com.waycast.macos WAYCAST_OCR_FILE -string "/tmp/图片.png"
+        //   defaults write com.waycast.macos WAYCAST_OCR_EXIT -bool true     # 出结果即退出
+        //   defaults write com.waycast.macos WAYCAST_OCR_LANG -string "zhEn" # 可选
+        //   defaults write com.waycast.macos WAYCAST_OCR_LAYOUT -string "paragraph" # 可选
+        if let path = UserDefaults.standard.string(forKey: "WAYCAST_OCR_FILE") {
+            let exitWhenDone = UserDefaults.standard.bool(forKey: "WAYCAST_OCR_EXIT")
+            DispatchQueue.main.asyncAfter(deadline: .now() + (exitWhenDone ? 0.3 : 1.5)) {
+                OcrEntry.debugRecognizeFile(path, exitWhenDone: exitWhenDone)
+            }
+        } else {
+        }
+
+        // 开发者钩子：自动进入截图态并**摆好一个假选区**（框选要人手，自动化验证
+        // 看不到工具栏）。配合 WAYCAST_NO_CAPTURE 用，屏幕内容被换成纯灰，
+        // 截图核对界面时不会拍到任何真实内容。
+        //   defaults write com.waycast.macos WAYCAST_NO_CAPTURE -bool true
+        //   defaults write com.waycast.macos WAYCAST_AUTO_CAPTURE_SELECT -float 0.45
+        //   defaults write com.waycast.macos WAYCAST_AUTO_ANNOTATE -bool true
+        if UserDefaults.standard.object(forKey: "WAYCAST_AUTO_CAPTURE_SELECT") != nil {
+            let fraction = UserDefaults.standard.double(forKey: "WAYCAST_AUTO_CAPTURE_SELECT")
+            if fraction > 0 {
+                let annotate = UserDefaults.standard.bool(forKey: "WAYCAST_AUTO_ANNOTATE")
+                let report = UserDefaults.standard.string(forKey: "WAYCAST_BENCH_OUT")
+                    ?? "/tmp/waycast_undo_probe.txt"
+                try? "Waycast probe — \(Date())\n".write(toFile: report, atomically: true, encoding: .utf8)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    self?.captureController.start()
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { [weak self] in
+                    guard let self else { return }
+                    self.captureController.debugSelect(fraction: CGFloat(fraction), annotate: annotate)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                    guard let self else { return }
+                    let c = self.captureController
+                    c.debugLog("摆好选区：annotations=\(c.debugAnnotationCount)"
+                               + "  第一响应者=\(c.debugFirstResponder.map { String(describing: type(of: $0)) } ?? "nil")",
+                               to: report)
+                }
+                // 3.5s 时合成一次 ⌘Z（和真人按键同一条链路），再记一笔数量。
+                if UserDefaults.standard.bool(forKey: "WAYCAST_AUTO_UNDO") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+                        guard let self else { return }
+                        let report = UserDefaults.standard.string(forKey: "WAYCAST_BENCH_OUT")
+                            ?? "/tmp/waycast_undo_probe.txt"
+                        self.captureController.debugLog("发送合成 ⌘Z…", to: report)
+                        CaptureBench.synthCommandZ()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                            guard let self else { return }
+                            let n = self.captureController.debugAnnotationCount
+                            self.captureController.debugLog(
+                                "⌘Z 之后：annotations=\(n)  "
+                                + (n == 1 ? "结论：⌘Z 生效 ✓" : "结论：⌘Z 没生效 ✗"),
+                                to: report)
+                            if UserDefaults.standard.bool(forKey: "WAYCAST_BENCH_EXIT") {
+                                NSApp.terminate(nil)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 开发者钩子：截图延迟基准测试（拆解「按 F1 → 覆盖层可见」的耗时构成）。
+        //   defaults write com.waycast.macos WAYCAST_CAPTURE_BENCH -bool true
+        //   defaults write com.waycast.macos WAYCAST_CAPTURE_BENCH_EXIT -bool true
+        if UserDefaults.standard.bool(forKey: "WAYCAST_CAPTURE_BENCH") {
+            let exitWhenDone = UserDefaults.standard.bool(forKey: "WAYCAST_CAPTURE_BENCH_EXIT")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                CaptureBench.run(iterations: 5, exitWhenDone: exitWhenDone)
             }
         }
     }
@@ -179,13 +274,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        let search = NSMenuItem(title: "搜索  ⌥Space", action: #selector(showSearch), keyEquivalent: "")
+        // 标题里的按键提示跟着实际配置走 —— 之前是硬编码的，改了快捷键菜单还写着旧键。
+        let search = NSMenuItem(title: "搜索  \(settings.searchHotkey.displayString)",
+                                action: #selector(showSearch), keyEquivalent: "")
         search.target = self
         menu.addItem(search)
+        searchMenuItem = search
 
-        let shot = NSMenuItem(title: "截图  F1", action: #selector(startCapture), keyEquivalent: "")
+        let shot = NSMenuItem(title: "截图  \(settings.captureHotkey.displayString)",
+                              action: #selector(startCapture), keyEquivalent: "")
         shot.target = self
         menu.addItem(shot)
+        captureMenuItem = shot
+
+        let ocrClip = NSMenuItem(title: "图片取字（剪贴板）  \(settings.ocrHotkey.displayString)",
+                                 action: #selector(ocrFromClipboard), keyEquivalent: "")
+        ocrClip.target = self
+        menu.addItem(ocrClip)
+        ocrClipboardMenuItem = ocrClip
+
+        let ocrFile = NSMenuItem(title: "图片取字（选择文件…）",
+                                 action: #selector(ocrFromFile), keyEquivalent: "")
+        ocrFile.target = self
+        menu.addItem(ocrFile)
 
         menu.addItem(.separator())
 
@@ -196,6 +307,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         InputSourceLock.shared.onChange = { [weak lock] in
             lock?.state = InputSourceLock.shared.isLocked ? .on : .off
         }
+
+        // 「接管裸 F 键（keyDown 通道）」开关。
+        //
+        // 为什么单独列出来：这条通道要遮住整条 keyDown / keyUp，是全应用里风险最高的
+        // 一处（见 MediaKeyBindings 文件头的事故记录 —— 之前的版本就是它把键盘整体卡死）。
+        // 所以它默认关，并且**必须有一个不用键盘、用鼠标点一下就能关掉的入口**：
+        // 万一又出现「按键没反应」，这里点一下立刻恢复（关掉后 tap 最多只收 type 14）。
+        //
+        // 平时什么时候需要它：键盘被设成「将 F1、F2 等键用作标准功能键」时，顶排键
+        // 不再发 NX_SYSDEFINED，只能靠这条通道接。本机默认（媒体键模式）用不上。
+        let topRow = NSMenuItem(title: "接管裸 F 键（keyDown 通道，键盘异常时可关掉）",
+                                action: #selector(toggleTopRowKeyDownChannel),
+                                keyEquivalent: "")
+        topRow.target = self
+        topRow.state = settings.topRowKeyDownChannel ? .on : .off
+        menu.addItem(topRow)
+        topRowMenuItem = topRow
 
         // 状态栏图标：四选一。勾选后状态栏换成对应读数，再点一次切回默认闪电图标。
         // 菜单打开期间这几项还会带上实时读数（内存水位 42% / 网速 ↓1.2 MB/s / CPU 温度 48°C）。
@@ -233,18 +361,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func registerHotkeys() {
         hotkeyManager.unregisterAll()
-        hotkeyManager.register(id: .search, config: settings.searchHotkey) {
-            Task { @MainActor in
-                guard !self.suspendedByStatusMenu() else { return }
-                self.searchController.toggle()
+        // 热键回调是**同步**跑在主线程上的（见 HotkeyManager），所以这里别提 Task
+        // 再兜一层 —— 每多一次 hop 就多等最多一帧，截图最吃亏。
+        // 闭包一律 [weak self]：hotkeyManager 由 delegate 持有，闭包再强引用
+        // delegate 就成环了。
+        hotkeyManager.register(id: .search, config: settings.searchHotkey) { [weak self] in
+            guard let self, !self.suspendedByStatusMenu() else { return }
+            self.searchController.toggle()
+        }
+        hotkeyManager.register(id: .capture, config: settings.captureHotkey) { [weak self] in
+            guard let self, !self.suspendedByStatusMenu() else { return }
+            self.captureController.start()
+        }
+        hotkeyManager.register(id: .ocrClipboard, config: settings.ocrHotkey) { [weak self] in
+            guard let self, !self.suspendedByStatusMenu() else { return }
+            OcrEntry.recognizeClipboard()
+        }
+
+        // 顶排「特殊功能键」（亮度 / 音量 / 播放…）在 macOS 上是 NX_SYSDEFINED 事件，
+        // Carbon 的 RegisterEventHotKey 抓不到它们 —— 这类绑定改由 MediaKeyBindings
+        // 的 event tap 接管。没绑任何特殊键时那个 tap 根本不会安装，行为与以前一致。
+        // （同时仍然按 F 键位置做一次 Carbon 注册：这样按住 fn 再按时也多一条触发路径。）
+        // 绑定 F1/F2/F5–F12 时会**自动**接管同一颗键在媒体键模式下的 NX_SYSDEFINED
+        // —— 见 HotkeyConfig.mediaKeyTypeResolved。
+        //
+        // 第二条通道是**裸功能键**（F1–F20 的 keyDown）：只有键盘被设成「标准功能键
+        // 模式」时顶排键才会这样进来。**默认关** —— 这条通道要遮住所有按键，风险最高，
+        // 2026-09-25 曾因此把用户键盘整体卡死（见 MediaKeyBindings 文件头）。
+        // 本机默认（媒体键模式）完全用不上它：实测顶排键全是 type 14。
+        //
+        // ⚠️ 登记时把 keyCode **归一到标准模式那套**：顶排键有标准 / 媒体键模式两套
+        // keyCode，归一后同一个绑定在两种模式下都成立。
+        // 同一个动作可能在两条通道里都出现 —— 比如 F2：不按 fn 时是「亮度 +」，
+        // 换成普通外接键盘按就是普通的 F2，两条都该触发截图。
+        var mediaActions: [Int: @MainActor () -> Void] = [:]
+        var functionActions: [UInt32: @MainActor () -> Void] = [:]
+
+        let searchAction: @MainActor () -> Void = { [weak self] in
+            guard let self, !self.suspendedByStatusMenu() else { return }
+            self.searchController.toggle()
+        }
+        let captureAction: @MainActor () -> Void = { [weak self] in
+            guard let self, !self.suspendedByStatusMenu() else { return }
+            self.captureController.start()
+        }
+        let ocrAction: @MainActor () -> Void = { [weak self] in
+            guard let self, !self.suspendedByStatusMenu() else { return }
+            OcrEntry.recognizeClipboard()
+        }
+
+        let bindings: [(AppSettings.HotkeyConfig, @MainActor () -> Void)] = [
+            (settings.searchHotkey, searchAction),
+            (settings.captureHotkey, captureAction),
+            (settings.ocrHotkey, ocrAction),
+        ]
+        for (config, action) in bindings {
+            if let keyType = config.mediaKeyTypeResolved { mediaActions[Int(keyType)] = action }
+            if config.isRawFunctionKey {
+                // 归一化后再登记，兼容历史配置里可能存着的媒体模式 keyCode。
+                let norm = config.keyCode <= UInt32(UInt16.max)
+                    ? UInt32(KeyCodes.normalizedTopRowKey(UInt16(config.keyCode)))
+                    : config.keyCode
+                functionActions[norm] = action
             }
         }
-        hotkeyManager.register(id: .capture, config: settings.captureHotkey) {
-            Task { @MainActor in
-                guard !self.suspendedByStatusMenu() else { return }
-                self.captureController.start()
-            }
+        MediaKeyBindings.shared.setKeyDownChannel(settings.topRowKeyDownChannel)
+        MediaKeyBindings.shared.update(mediaActions: mediaActions,
+                                       functionActions: functionActions)
+        // 注册失败的组合键是**静默**失效的（被别的 App 占了），这里主动记一笔。
+        if !hotkeyManager.failed.isEmpty {
+            let names = hotkeyManager.failed.map { "\($0)" }.joined(separator: ", ")
+            NSLog("[Waycast] 以下快捷键未能注册（可能被其他 App 占用）：%@", names)
         }
+        refreshStatusMenu()
+    }
+
+    /// 快捷键改动后更新菜单里的按键提示。
+    ///
+    /// 这里**只改标题**，绝不替换整个 `statusItem.menu` —— 曾经在启动阶段做
+    /// `statusItem.menu = 新菜单`，`applicationDidFinishLaunching` 会在那一行
+    /// 停住不再返回（后续初始化全部不执行）。就地改标题既够用又没有这个坑。
+    func refreshStatusMenu() {
+        searchMenuItem?.title = "搜索  \(settings.searchHotkey.displayString)"
+        captureMenuItem?.title = "截图  \(settings.captureHotkey.displayString)"
+        ocrClipboardMenuItem?.title = "图片取字（剪贴板）  \(settings.ocrHotkey.displayString)"
     }
 
     /// Hotkeys are ignored while the status menu is open and for a short
@@ -258,7 +458,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showSearch() { searchController.toggle() }
     @objc private func startCapture() { captureController.start() }
+    @objc private func ocrFromClipboard() { OcrEntry.recognizeClipboard() }
+    @objc private func ocrFromFile() { OcrEntry.recognizeImageFiles() }
     @objc private func toggleInputLock() { InputSourceLock.shared.toggle() }
+
+    /// 「接管裸 F 键（keyDown 通道）」开关 —— 见 `buildStatusMenu()` 里的说明。
+    /// 这是键盘万一出怪问题时**唯一不用键盘的出口**，所以菜单项必须一直可达。
+    @objc private func toggleTopRowKeyDownChannel() {
+        let on = !settings.topRowKeyDownChannel
+        settings.topRowKeyDownChannel = on
+        MediaKeyBindings.shared.setKeyDownChannel(on)
+        topRowMenuItem?.state = on ? .on : .off
+    }
 
     @objc private func selectStatusIcon(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
@@ -358,6 +569,9 @@ extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         statusMenuTracking = true
         statusMenuClosedAt = nil
+        // 「接管裸 F 键」在两处能改（设置界面 + 这个菜单），勾选态以设置为准 ——
+        // 菜单是一次性建好的，不在这里同步的话，从设置里改过之后勾就会骗人。
+        topRowMenuItem?.state = settings.topRowKeyDownChannel ? .on : .off
         startStatusIconReadings()
     }
 

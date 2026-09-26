@@ -42,7 +42,29 @@ final class EventTap {
     /// While set, every keyDown is swallowed and forwarded here instead of
     /// reaching the system — the settings window uses this to record a new
     /// shortcut without ⌘Tab popping the system switcher.
-    var recordingHandler: ((Int, CGEventFlags) -> Void)?
+    ///
+    /// ⚠️ 这个状态是**全局危险**的：它会吞掉系统里每一个 keyDown，也就是
+    /// 「键盘打不了字」。2026-09-25 出过一次键盘整体卡死，事后把所有能让它
+    /// 卡住的路径都堵上了：上层有 Esc / 关窗 / 10 秒超时三重清理，这里再加
+    /// 一道**兜底闸** —— 超过 `recordingLease` 一定自动解除，哪怕上层全忘了。
+    var recordingHandler: ((Int, CGEventFlags) -> Void)? {
+        didSet {
+            recordingDeadline = recordingHandler == nil
+                ? nil : Date().addingTimeInterval(EventTap.recordingLease)
+        }
+    }
+
+    /// 兜底闸的租约时长 —— 比上层那 10 秒超时略长，正常情况下轮不到它出手。
+    private static let recordingLease: TimeInterval = 15
+
+    /// 非 nil 表示「录制中的吞键状态」到这一刻必须结束。
+    private var recordingDeadline: Date?
+
+    /// 到点就自己解除，绝不允许无限期吞键。
+    private func expireRecordingIfNeeded() {
+        guard let deadline = recordingDeadline, Date() > deadline else { return }
+        recordingHandler = nil
+    }
 
     /// Tracks a swallowed side-button press so its up event is balanced.
     private var sideDownConsumed = false
@@ -119,6 +141,9 @@ final class EventTap {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
+
+        // 兜底闸：录制状态绝不允许无限期存在（见 recordingHandler 的注释）。
+        expireRecordingIfNeeded()
 
         // Paused (settings window recording a shortcut): swallow every keyDown
         // and hand it to the recorder — the system never sees ⌘Tab, so its

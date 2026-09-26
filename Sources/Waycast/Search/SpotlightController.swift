@@ -167,7 +167,10 @@ final class SpotlightController: NSObject {
 
         viewModel.onClose = { [weak self] in self?.hide() }
         panel.makeKeyAndOrderFront(nil)
-        viewModel.reset()
+        viewModel.reset(keepingQuery: true)
+        // 上次的查询词还在（hide 不清空）—— 重新触发一次搜索把结果列表还原；
+        // 词是空的就保持收起状态。
+        if !viewModel.query.isEmpty { viewModel.queryChanged() }
         installKeyMonitor()
         installClickMonitors()
         observeHeight(width: width)
@@ -251,7 +254,8 @@ final class SpotlightController: NSObject {
         heightCancellable = nil
         moveCancellable = nil
         panel?.orderOut(nil)
-        viewModel.reset()
+        // 保留 query：误触/误关后下次呼出不用重新输入（见 reset 的注释）。
+        viewModel.reset(keepingQuery: true)
     }
 
     // MARK: - Keyboard

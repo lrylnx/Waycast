@@ -48,8 +48,15 @@ enum FrozenCapture {
 
     /// Touch SCK once at launch so the first capture doesn't pay the
     /// shareable-content enumeration cost.
+    ///
+    /// 光枚举 shareable content 不够：实测**启动后第一次抓屏要 197ms**，
+    /// 而真正贵的是"第一次把 SCStream 管线跑起来"（冷启动 ~67ms）+ 那时
+    /// 应用还在做别的初始化（Vision 模型加载等）。所以这里干脆空跑一整条
+    /// 默认抓屏路径，把管线预热掉，结果直接丢掉。
     static func prewarm() async {
-        _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        _ = try? await shareableContent()
+        _ = try? await displayList()          // 顺手把显示器列表也缓存上
+        _ = try? await captureAllScreens()    // 空跑一次：让第一次真按键就是"热"的
     }
 
     /// Freeze every connected display concurrently.
@@ -68,8 +75,18 @@ enum FrozenCapture {
         // Preferred: SCStream single-frame. Streaming has "screen share"
         // semantics on macOS 26 and never plays the screenshot zoom animation
         // (unlike SCScreenshotManager and the screencapture CLI, which both do).
+        let hadCachedDisplays = isDisplayCacheFresh()
         if let screens = try? await captureAllScreensViaStream(), !screens.isEmpty {
             return screens
+        }
+        // 只有**确实用了缓存**才重试一次：缓存可能已过期（插拔显示器 / 分辨率变了），
+        // 清掉再枚举一次就行。之后再降级到 CLI —— CLI 要 136–186ms 而且会触发
+        // Tahoe 的缩放动画，是最后手段，不该被一次陈旧缓存骗出来。
+        if hadCachedDisplays {
+            invalidateDisplayCache()
+            if let screens = try? await captureAllScreensViaStream(), !screens.isEmpty {
+                return screens
+            }
         }
         if let screens = try? await captureAllScreensViaCLI(), !screens.isEmpty {
             return screens
@@ -102,9 +119,44 @@ enum FrozenCapture {
 
     // MARK: SCStream single-frame path (default)
 
+    // 显示器列表缓存：`SCShareableContent` 每次要 ~11–20ms（实测），而按 F1 这条
+    // 路径上一秒内可能连点好几次。显示器拓扑平时几乎不变，缓存 30 秒就够；
+    // 窗口列表**不**缓存（随时在变），所以窗口截图那条路仍然现取。
+    private static let displayCacheLock = NSLock()
+    private static var cachedDisplays: (list: [SCDisplay], at: CFTimeInterval)?
+
+    /// 把加锁区放进**同步**函数里：直接在 async 函数体内调 `lock()/unlock()`
+    /// 会吃 "unavailable from asynchronous contexts" 告警（Swift 6 下是错误）。
+    private static func withCacheLock<T>(_ body: () -> T) -> T {
+        displayCacheLock.lock()
+        defer { displayCacheLock.unlock() }
+        return body()
+    }
+
+    /// 插拔显示器 / 改分辨率时调一次，让下次截图重新枚举。
+    static func invalidateDisplayCache() {
+        withCacheLock { cachedDisplays = nil }
+    }
+
+    private static func isDisplayCacheFresh() -> Bool {
+        withCacheLock {
+            guard let c = cachedDisplays else { return false }
+            return !c.list.isEmpty && CACurrentMediaTime() - c.at < 30
+        }
+    }
+
+    private static func displayList() async throws -> [SCDisplay] {
+        if let hit = withCacheLock({ cachedDisplays.flatMap {
+            CACurrentMediaTime() - $0.at < 30 ? $0.list : nil
+        } }), !hit.isEmpty { return hit }
+
+        let list = try await shareableContent().displays
+        withCacheLock { cachedDisplays = (list, CACurrentMediaTime()) }
+        return list
+    }
+
     private static func captureAllScreensViaStream() async throws -> [FrozenScreen] {
-        let content = try await shareableContent()
-        let displays = Dictionary(uniqueKeysWithValues: content.displays.map { ($0.displayID, $0) })
+        let displays = Dictionary(uniqueKeysWithValues: try await displayList().map { ($0.displayID, $0) })
         let topology = await MainActor.run {
             NSScreen.screens.compactMap { screen -> (CGDirectDisplayID, CGRect, CGFloat)? in
                 guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
@@ -483,5 +535,93 @@ enum FrozenCapture {
                 }
             }
         }
+    }
+
+    // MARK: - Latency benchmark (developer hook)
+
+    /// 把每条抓帧路径、每个阶段都量一遍，用于回答「按 F1 之后那几十~几百毫秒花在哪」。
+    private static func elapsed(_ t: CFTimeInterval) -> String {
+        String(format: "%7.1f", (CACurrentMediaTime() - t) * 1000)
+    }
+
+    static func bench(iterations: Int) async -> String {
+        var lines: [String] = []
+
+        // ① 枚举 shareable content —— 每条路径开头都要做一遍。
+        for i in 0..<iterations {
+            let t = CACurrentMediaTime()
+            let c = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            lines.append("  SCShareableContent[\(i)]  \(elapsed(t)) ms"
+                         + "  (displays=\(c?.displays.count ?? -1) windows=\(c?.windows.count ?? -1))")
+        }
+
+        // ② 单个显示器：启流 / 等首帧 / 停流 三段分解。
+        if let content = try? await shareableContent() {
+            let topology = await MainActor.run {
+                NSScreen.screens.compactMap { screen -> (CGDirectDisplayID, CGRect)? in
+                    guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+                            as? CGDirectDisplayID else { return nil }
+                    return (id, screen.frame)
+                }
+            }
+            for (id, frame) in topology {
+                guard let display = content.displays.first(where: { $0.displayID == id }) else { continue }
+                for i in 0..<iterations {
+                    let filter = SCContentFilter(display: display, excludingWindows: [])
+                    let scale = CGFloat(filter.pointPixelScale)
+                    let config = SCStreamConfiguration()
+                    config.width = max(2, Int((frame.width * scale).rounded()))
+                    config.height = max(2, Int((frame.height * scale).rounded()))
+                    config.showsCursor = false
+                    config.shouldBeOpaque = true
+                    config.queueDepth = 1
+                    config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+                    if #available(macOS 15.0, *) {
+                        config.captureResolution = .best
+                        config.captureDynamicRange = .SDR
+                    }
+                    let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+                    let grabber = SingleFrameGrabber()
+                    try? stream.addStreamOutput(grabber, type: .screen, sampleHandlerQueue: grabber.queue)
+
+                    let t0 = CACurrentMediaTime()
+                    try? await stream.startCapture()
+                    let t1 = CACurrentMediaTime()
+                    let image = try? await grabber.firstFrame(timeout: 4)
+                    let t2 = CACurrentMediaTime()
+                    try? await stream.stopCapture()
+                    let t3 = CACurrentMediaTime()
+                    let dims = image.map { "\($0.width)x\($0.height)" } ?? "nil"
+                    lines.append("  stream disp\(id)[\(i)]  start=\(elapsed(t0))"
+                                 + "  firstFrame=\(String(format: "%7.1f", (t2 - t1) * 1000))"
+                                 + "  stop=\(String(format: "%7.1f", (t3 - t2) * 1000))"
+                                 + "  total=\(String(format: "%7.1f", (t3 - t0) * 1000)) ms  \(dims)")
+                }
+            }
+        }
+
+        // ③ 各条完整路径（含各自的 shareableContent 开销）。
+        for i in 0..<iterations {
+            let t = CACurrentMediaTime()
+            let r = try? await captureAllScreensViaStream()
+            lines.append("  path stream[\(i)]   \(elapsed(t)) ms  ok=\(r?.count ?? -1)")
+        }
+        for i in 0..<iterations {
+            let t = CACurrentMediaTime()
+            let r = try? await captureAllScreensViaCLI()
+            lines.append("  path cli[\(i)]      \(elapsed(t)) ms  ok=\(r?.count ?? -1)")
+        }
+        for i in 0..<iterations {
+            let t = CACurrentMediaTime()
+            let r = try? await captureAllScreensViaSCK()
+            lines.append("  path sck[\(i)]      \(elapsed(t)) ms  ok=\(r?.count ?? -1)")
+        }
+        // 默认路径 = 真正的产品路径（stream → cli → sck 依次降级）。
+        for i in 0..<iterations {
+            let t = CACurrentMediaTime()
+            let r = try? await captureAllScreens()
+            lines.append("  path DEFAULT[\(i)]  \(elapsed(t)) ms  ok=\(r?.count ?? -1)")
+        }
+        return lines.joined(separator: "\n")
     }
 }

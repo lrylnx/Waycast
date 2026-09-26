@@ -57,8 +57,10 @@ final class PinnedShotView: NSView {
         wantsLayer = true
 
         let ocr = IconButton(frame: .zero)
-        ocr.image = NSImage(systemSymbolName: "doc.text.viewfinder", accessibilityDescription: "OCR 文字识别")?
-            .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))
+        // 和截图工具栏同一个自绘图标（圆角框里写 OCR），14×13，与旁边 12pt 的
+        // xmark 视觉重量对齐。
+        ocr.image = CaptureSelectionView.ocrGlyphIcon(height: 13)
+        ocr.imageScaling = .scaleProportionallyDown
         ocr.isBordered = false
         ocr.toolTip = "OCR 文字识别"
         ocr.setAccessibilityLabel("OCR 文字识别")
@@ -150,15 +152,10 @@ final class PinnedShotController: NSObject {
         }
         content.onOCR = { [weak panel, image] in
             guard let panel else { return }
-            let frame = panel.frame
-            Task { @MainActor in
-                let text = await CaptureController.recognizeText(in: image)
-                guard !text.isEmpty else {
-                    Toast.show("未识别到文字")
-                    return
-                }
-                OCRResultWindowController.shared.show(text: text, near: frame)
-            }
+            // 识别与展示都在结果窗口里（它显示「正在识别…」，并支持换语言重算）。
+            OcrResultWindowController.shared.show(image: image,
+                                                 sourceName: "贴图",
+                                                 near: panel.frame)
         }
         panel.contentView = content
         // Appear without animation: order front while transparent, then flip.
