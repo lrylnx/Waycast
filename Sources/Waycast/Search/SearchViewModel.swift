@@ -30,6 +30,9 @@ final class SearchViewModel: ObservableObject {
     /// `keepingQuery: true` 用于 hide/show —— **保留输入框里的词**：误触呼出、
     /// 点外面误关之后，下次呼出还在，不用重新打一遍。用户手动删空过的词
     /// 自然就是空，无需特殊处理。列表仍然收起（结果由 show 时重新搜索刷新）。
+    ///
+    /// 保留多久由调用方决定：`SpotlightController` 只认 30 秒内的重开
+    /// （`queryMemoryWindow`），超时就传 `false` 清空。
     func reset(keepingQuery: Bool = false) {
         if !keepingQuery { query = "" }
         appResults = []

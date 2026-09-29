@@ -103,6 +103,15 @@ final class SpotlightController: NSObject {
     private let viewModel = SearchViewModel()
     private var heightCancellable: AnyCancellable?
     private var moveCancellable: AnyCancellable?
+    /// 输入框记忆的**起点**：面板隐藏的时刻。nil = 当前没有待生效的记忆。
+    ///
+    /// 记忆的用途只有一个：**误触关闭**（Esc 按错、点到面板外面）后重新呼出，
+    /// 不用把词再打一遍。所以只保留 `queryMemoryWindow` 秒，超时即视为「上一轮搜索
+    /// 已经结束」，呼出时清空 —— 免得每次都得手动删掉上次的词。
+    private var hiddenAt: Date?
+
+    /// 输入框记忆的保留时长。
+    static let queryMemoryWindow: TimeInterval = 30
 
     var isVisible: Bool { panel?.isVisible ?? false }
 
@@ -167,7 +176,11 @@ final class SpotlightController: NSObject {
 
         viewModel.onClose = { [weak self] in self?.hide() }
         panel.makeKeyAndOrderFront(nil)
-        viewModel.reset(keepingQuery: true)
+        // 只有「刚关掉又立刻呼出」（≤ queryMemoryWindow）才接着上次的词，
+        // 否则清空 —— 会话早就结束了，留着只会挡事。
+        let keep = hiddenAt.map { Date().timeIntervalSince($0) <= Self.queryMemoryWindow } ?? false
+        hiddenAt = nil
+        viewModel.reset(keepingQuery: keep)
         // 上次的查询词还在（hide 不清空）—— 重新触发一次搜索把结果列表还原；
         // 词是空的就保持收起状态。
         if !viewModel.query.isEmpty { viewModel.queryChanged() }
@@ -254,7 +267,8 @@ final class SpotlightController: NSObject {
         heightCancellable = nil
         moveCancellable = nil
         panel?.orderOut(nil)
-        // 保留 query：误触/误关后下次呼出不用重新输入（见 reset 的注释）。
+        // 记下隐藏时刻：只在这之后 `queryMemoryWindow` 秒内重开才保留输入（见 show）。
+        hiddenAt = Date()
         viewModel.reset(keepingQuery: true)
     }
 
