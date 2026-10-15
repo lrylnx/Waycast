@@ -25,11 +25,21 @@ final class SearchEngine {
         lock.lock(); defer { lock.unlock() }
         return _queryGeneration == generation
     }
-    private func setCurrent(_ md: MDQuery?) -> MDQuery? {
+    // Reject queued work that was invalidated before registration.
+    private func register(_ md: MDQuery, generation: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        let old = _currentQuery
+        guard _queryGeneration == generation else { return false }
         _currentQuery = md
-        return old
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        _queryGeneration += 1
+        let previous = _currentQuery
+        _currentQuery = nil
+        lock.unlock()
+        if let previous { MDQueryStop(previous) }
     }
     private func clearCurrentIf(_ md: MDQuery) {
         lock.lock(); defer { lock.unlock() }
@@ -83,6 +93,7 @@ final class SearchEngine {
     func search(text: String,
                 onApps: @escaping ([SearchItem]) -> Void,
                 onFiles: @escaping ([SearchItem]) -> Void) {
+        cancel()
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             onApps([]); onFiles([]); return
@@ -92,9 +103,6 @@ final class SearchEngine {
         let generation = bumpGeneration()
         let predicate = Self.buildQueryString(trimmed)
 
-        // Stop any in-flight query before starting a new one.
-        if let previous = setCurrent(nil) { MDQueryStop(previous) }
-
         // Run Spotlight SYNCHRONOUSLY on the background queue with NO dispatch
         // queue attached. That guarantees the result list cannot be mutated
         // while we iterate it, so the MDItem pointers returned by
@@ -102,12 +110,25 @@ final class SearchEngine {
         // dispatch queue (the old async mode) let Spotlight purge results
         // mid-iteration — the dangling MDItem was the objc_release SIGSEGV.
         spotlightQueue.async { [weak self] in
-            guard let self else { return }
-            guard let md = MDQueryCreate(kCFAllocatorDefault, predicate as CFString, nil, nil) else { return }
-            _ = self.setCurrent(md)
+            guard let self, self.isCurrent(generation) else { return }
+            guard let md = MDQueryCreate(kCFAllocatorDefault, predicate as CFString, nil, nil) else {
+                DispatchQueue.main.async {
+                    if self.isCurrent(generation) { onFiles([]) }
+                }
+                return
+            }
+            guard self.register(md, generation: generation) else { return }
+            guard self.isCurrent(generation) else {
+                self.clearCurrentIf(md)
+                return
+            }
             // kMDQuerySyncExecution = 1: blocks this queue until gathering is
             // done; MDQueryStop() from another thread aborts it early.
             _ = MDQueryExecute(md, CFOptionFlags(1))
+            guard self.isCurrent(generation) else {
+                self.clearCurrentIf(md)
+                return
+            }
             let (items, droppedInDocuments) = self.collect(md, limit: 40)
             self.clearCurrentIf(md)
             DispatchQueue.main.async {

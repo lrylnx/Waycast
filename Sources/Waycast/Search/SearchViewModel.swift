@@ -22,6 +22,7 @@ final class SearchViewModel: ObservableObject {
     var onClose: (() -> Void)?
 
     private var debounceTask: Task<Void, Never>?
+    private var searchGeneration = 0
 
     var allResults: [SearchItem] { appResults + fileResults }
 
@@ -34,6 +35,8 @@ final class SearchViewModel: ObservableObject {
     /// 保留多久由调用方决定：`SpotlightController` 只认 30 秒内的重开
     /// （`queryMemoryWindow`），超时就传 `false` 清空。
     func reset(keepingQuery: Bool = false) {
+        searchGeneration += 1
+        SearchEngine.shared.cancel()
         if !keepingQuery { query = "" }
         appResults = []
         fileResults = []
@@ -46,11 +49,14 @@ final class SearchViewModel: ObservableObject {
 
     func queryChanged() {
         debounceTask?.cancel()
+        searchGeneration += 1
+        let generation = searchGeneration
+        SearchEngine.shared.cancel()
         let text = query
-        if text.trimmingCharacters(in: .whitespaces).isEmpty {
-            appResults = []
-            fileResults = []
-            selectedIndex = 0
+        appResults = []
+        fileResults = []
+        selectedIndex = 0
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             isSearching = false
             updateListHeight()
             return
@@ -61,12 +67,12 @@ final class SearchViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 60_000_000) // 60ms debounce
             guard !Task.isCancelled, let self else { return }
             SearchEngine.shared.search(text: text) { [weak self] apps in
-                guard let self, self.query == text else { return }
+                guard let self, self.searchGeneration == generation else { return }
                 self.appResults = apps
                 self.clampSelection()
                 self.updateListHeight()
             } onFiles: { [weak self] files in
-                guard let self, self.query == text else { return }
+                guard let self, self.searchGeneration == generation else { return }
                 self.fileResults = files
                 self.isSearching = false
                 self.clampSelection()
@@ -88,7 +94,7 @@ final class SearchViewModel: ObservableObject {
             listHeight = min(h, 460)
         } else if isSearching {
             listHeight = 52
-        } else if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+        } else if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             listHeight = 96
         } else {
             listHeight = 0

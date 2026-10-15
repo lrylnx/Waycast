@@ -15,15 +15,25 @@ final class ClipboardController: NSObject, NSMenuDelegate {
     private var timer: Timer?
     private var lastChangeCount: Int = NSPasteboard.general.changeCount
 
-    private let storeURL: URL = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory,
-                                           in: .userDomainMask)[0]
-            .appendingPathComponent("Waycast", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("clipboard_history.json")
-    }()
+    private let storeURL: URL
+
+    init(storeURL: URL? = nil) {
+        if let storeURL {
+            self.storeURL = storeURL
+        } else {
+            let dir = FileManager.default.urls(for: .applicationSupportDirectory,
+                                               in: .userDomainMask)[0]
+                .appendingPathComponent("Waycast", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            self.storeURL = dir.appendingPathComponent("clipboard_history.json")
+        }
+        super.init()
+    }
+
+    deinit { timer?.invalidate() }
 
     func start() {
+        guard timer == nil else { return }
         load()
         menu.delegate = self
         menu.autoenablesItems = false
@@ -31,6 +41,7 @@ final class ClipboardController: NSObject, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.poll()
         }
+        timer?.tolerance = 0.1
         RunLoop.main.add(timer!, forMode: .common)
     }
 
@@ -43,14 +54,11 @@ final class ClipboardController: NSObject, NSMenuDelegate {
         entries = Array(saved.prefix(limit))
     }
 
-    private func save() {
-        // Atomic write; happens on every history mutation (a few per minute
-        // at most, tiny payload — no need to debounce).
+    func save() {
+        // Atomic writes also create the destination on the first launch.
         do {
             let data = try JSONEncoder().encode(entries)
-            let tmp = storeURL.appendingPathExtension("tmp")
-            try data.write(to: tmp)
-            _ = try FileManager.default.replaceItemAt(storeURL, withItemAt: tmp)
+            try data.write(to: storeURL, options: .atomic)
         } catch {
             NSLog("Waycast clipboard save failed: %@", "\(error)")
         }
@@ -105,6 +113,7 @@ final class ClipboardController: NSObject, NSMenuDelegate {
         let text = entries[sender.tag].text
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+        lastChangeCount = NSPasteboard.general.changeCount
         // Move to top.
         entries.remove(at: sender.tag)
         entries.insert(Entry(text: text, date: Date()), at: 0)
@@ -126,7 +135,12 @@ final class ClipboardController: NSObject, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        // Refresh in case limit changed.
+        // Enforce a reduced limit immediately, including the persisted history.
+        let limit = AppSettings.shared.clipboardLimit
+        if entries.count > limit {
+            entries = Array(entries.prefix(limit))
+            save()
+        }
         rebuildMenu()
     }
 }

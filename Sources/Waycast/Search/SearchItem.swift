@@ -59,7 +59,7 @@ final class ThumbnailCache {
 
     private let cache = NSCache<NSString, NSImage>()
     private let generator = QLThumbnailGenerator.shared
-    private var inFlight = Set<String>()
+    private var inFlight: [String: [(NSImage) -> Void]] = [:]
     private let lock = NSLock()
 
     init() { cache.countLimit = 400 }
@@ -67,14 +67,22 @@ final class ThumbnailCache {
     /// Returns the cached thumbnail if present, else starts generation and
     /// calls `onReady` on the main thread when done.
     func thumbnail(for url: URL, size: CGFloat, onReady: @escaping (NSImage) -> Void) -> NSImage? {
-        let key = url.path
+        let key = "\(url.path)|\(size)"
         if let hit = cache.object(forKey: key as NSString) { return hit }
 
         lock.lock()
-        let already = inFlight.contains(key)
-        if !already { inFlight.insert(key) }
+        if inFlight[key] != nil {
+            inFlight[key, default: []].append(onReady)
+            lock.unlock()
+            return nil
+        }
+        // Recheck under the lock in case a generation just completed.
+        if let hit = cache.object(forKey: key as NSString) {
+            lock.unlock()
+            return hit
+        }
+        inFlight[key] = [onReady]
         lock.unlock()
-        guard !already else { return nil }
 
         let request = QLThumbnailGenerator.Request(fileAt: url,
                                                    size: CGSize(width: size, height: size),
@@ -82,18 +90,18 @@ final class ThumbnailCache {
                                                    representationTypes: .thumbnail)
         generator.generateBestRepresentation(for: request) { [weak self] rep, _ in
             guard let self else { return }
-            self.lock.lock()
-            self.inFlight.remove(key)
-            self.lock.unlock()
             var image: NSImage
             if let rep {
                 image = NSImage(cgImage: rep.cgImage, size: NSSize(width: size, height: size))
             } else {
-                image = NSWorkspace.shared.icon(forFile: key)
+                image = NSWorkspace.shared.icon(forFile: url.path)
                 image.size = NSSize(width: size, height: size)
             }
+            self.lock.lock()
             self.cache.setObject(image, forKey: key as NSString)
-            DispatchQueue.main.async { onReady(image) }
+            let callbacks = self.inFlight.removeValue(forKey: key) ?? []
+            self.lock.unlock()
+            DispatchQueue.main.async { callbacks.forEach { $0(image) } }
         }
         return nil
     }

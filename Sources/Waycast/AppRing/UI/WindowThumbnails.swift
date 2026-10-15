@@ -11,6 +11,8 @@ final class WindowThumbnails {
     static let shared = WindowThumbnails()
 
     private let cache = NSCache<NSNumber, CGImage>()
+    private var generation = 0
+    private let captureQueue = DispatchQueue(label: "waycast.window-thumbnails", qos: .userInitiated)
 
     /// True when we've confirmed the user granted Screen Recording.
     static var hasScreenCapturePermission: Bool {
@@ -50,7 +52,8 @@ final class WindowThumbnails {
             completion(nil)
             return
         }
-        DispatchQueue.global(qos: .userInitiated).async {
+        let generation = self.generation
+        captureQueue.async { [weak self] in
             let options: CGWindowImageOption = [.boundsIgnoreFraming, .nominalResolution]
             guard let image = CGWindowListCreateImage(.null, .optionIncludingWindow,
                                                       CGWindowID(windowID), options) else {
@@ -77,7 +80,7 @@ final class WindowThumbnails {
                 result = image
             }
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
+                guard let self, self.generation == generation else { return }
                 self.cache.setObject(result, forKey: key)
                 completion(result)
             }
@@ -85,6 +88,7 @@ final class WindowThumbnails {
     }
 
     func purge() {
+        generation += 1
         cache.removeAllObjects()
     }
 }

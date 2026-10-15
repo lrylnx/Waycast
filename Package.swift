@@ -20,6 +20,7 @@ let package = Package(
                 .linkedFramework("IOKit"),
                 .linkedFramework("ScreenCaptureKit", .when(platforms: [.macOS])),
             ]
-        )
+        ),
+        .testTarget(name: "WaycastTests", dependencies: ["Waycast"])
     ]
 )
