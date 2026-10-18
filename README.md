@@ -56,7 +56,7 @@
 defaults write com.waycast.macos captureDimOpacity -float 0.6   # 0…1，0 = 完全不压暗
 ```
 
-遮罩带 200 ms 缓入：第一帧与实时屏幕**逐像素一致**，之后 120 Hz 渐入，所以进场不会被闪一下。强度在会话开始时快照一次，不在重绘路径里读 UserDefaults。
+遮罩进场是「首帧直接带 30% 压暗 + 120 ms / 60 Hz 收尾」：既有明确的"已经进截图态"信号，又不会亮暗跳变。强度在会话开始时快照一次，不在重绘路径里读 UserDefaults。
 
 ### 工具栏材质（液态玻璃）
 
@@ -67,6 +67,26 @@ defaults write com.waycast.macos captureDimOpacity -float 0.6   # 0…1，0 = �
 **SwiftUI 侧的玻璃**走同一个文件里的 `.glassPanel(cornerRadius:)` —— 底层同样是 `NSGlassEffectView`，但用的是系统给 SwiftUI 的 `.glassEffect(_:in:)` modifier，能正常参与 SwiftUI 的布局 / 动画 / 圆角裁剪，不必套一层 `NSViewRepresentable`（那样要么尺寸对不上，要么状态被隔离）。
 
 > 玻璃只能折射它**下面**的画面。截图覆盖层是同一个窗口里先铺冻结帧+遮罩、再叠工具栏，所以玻璃透出的是「已经被遮罩压暗的」内容，视觉上正好是一块浮在暗幕上的玻璃，层次是对的。
+
+### 按键到覆盖层的延迟（实测）
+
+`F1` → 冻结帧出现，**典型 40–55 ms**（M1 Max / 2560×1440 / macOS 27，5 连发实测 43.6 / 51.9 / 65.6 ms，偶发一次 100 ms）。构成：
+
+| 阶段 | 耗时 | 说明 |
+| --- | --- | --- |
+| 热键 → `start()` | <1 ms | 事件 tap 只做整数比较，动作异步派到主队列 |
+| 空壳挂上（十字光标生效） | ~1 ms | 什么都不画的透明面板，先把「我按到了」给出去 |
+| 抓帧（SCStream 启流 + 首帧） | 40–50 ms | 剩下的全在这 |
+| 面板 alpha 翻 1 + 取键盘焦点 | <1 ms | 面板常驻、原地翻可见性，没有开窗动画 |
+
+想自己复测：`defaults write com.waycast.macos WAYCAST_CAPTURE_BENCH -bool true` +
+`WAYCAST_CAPTURE_BENCH_QUICK -bool true` + `WAYCAST_BENCH_OUT -string /tmp/b.txt`，启动后读那个文件（详见 `CaptureBench.swift`）。
+
+⚠️ **别把「等首帧」写成「先置 finished 再等 continuation」**：macOS 27 上首帧常常在
+`SCStream.startCapture()` **返回之前**就送达，那种写法会把这帧丢掉、随后 `firstFrame()`
+立刻抛错，整条流路径静默失败 → 降级到 ~200 ms 的 `screencapture` CLI（还带系统整屏缩放
+动画）⇒ 手感就是「按一下等一秒」。抓帧器必须**先存结果、后接等待者**（`FrozenCapture.SingleFrameGrabber`）。
+另外 `stopCapture()` 要 10–29 ms，帧已经拿到了就别让用户等它 —— 丢后台停。
 
 ### 调试钩子
 

@@ -88,6 +88,14 @@ enum FrozenCapture {
                 return screens
             }
         }
+        // 26+ 的 `SCScreenshotManager.captureScreenshot` 实测只要 24–33ms，比 CLI
+        // 快 7 倍，而且保留窗口阴影 —— 让它在 CLI 前面当第一顺位兜底。CLI 要
+        // 185–210ms，还会放系统那个整屏缩放动画，只配当最后手段。
+        if #available(macOS 26.0, *) {
+            if let screens = try? await captureAllScreensViaSCK(), !screens.isEmpty {
+                return screens
+            }
+        }
         if let screens = try? await captureAllScreensViaCLI(), !screens.isEmpty {
             return screens
         }
@@ -201,25 +209,35 @@ enum FrozenCapture {
     /// Grabs exactly one frame from a stream, then signals completion. All
     /// state is confined to `queue`, which doubles as the sample-handler
     /// queue, so no extra locking is needed.
+    ///
+    /// ⚠️ 2026-10-18 macOS 27 修复：首帧**可能在 `startCapture()` 返回之前**
+    /// 就送达。老实现里 `finish()` 发现没人等就只置 `finished = true` 把这一帧
+    /// 丢掉，随后 `firstFrame()` 一看 `finished` 已真就**立刻抛错** —— 于是整条
+    /// 流路径必然失败、降级到 ~200ms 的 `screencapture` CLI（还带系统那个整屏
+    /// 缩放动画）。macOS 15 时首帧通常晚于 `startCapture()` 返回，这个竞态踩不
+    /// 到；27 上 `startCapture()` 变成 ~57ms、首帧更早，实测 8/10 次踩中 ⇒
+    /// 「按一下要等一秒」。现在早到的结果先存进 `result`，等待者一注册就立刻交付。
     private final class SingleFrameGrabber: NSObject, SCStreamOutput {
         private static let ciContext = CIContext(options: [
             CIContextOption.outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any,
         ])
 
         let queue = DispatchQueue(label: "waycast.stream.frame", qos: .userInitiated)
-        private var continuation: CheckedContinuation<CGImage, Error>?
-        private var finished = false
+        /// 已经拿到的结果 —— 不管是「先到帧」还是「先来等」。
+        private var result: Result<CGImage, Error>?
+        private var waiter: CheckedContinuation<CGImage, Error>?
 
         func firstFrame(timeout: TimeInterval) async throws -> CGImage {
             try await withCheckedThrowingContinuation { cont in
                 queue.async {
-                    guard !self.finished else {
-                        cont.resume(throwing: FrozenCaptureError.captureFailed)
+                    // 帧早于这里送达：直接交付，不再等。
+                    if let result = self.result {
+                        cont.resume(with: result)
                         return
                     }
-                    self.continuation = cont
+                    self.waiter = cont
                     self.queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
-                        self?.finish(.failure(FrozenCaptureError.captureFailed))
+                        self?.deliver(.failure(FrozenCaptureError.captureFailed))
                     }
                 }
             }
@@ -230,21 +248,24 @@ enum FrozenCapture {
                   let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
             guard let cg = Self.ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-                finish(.failure(FrozenCaptureError.captureFailed))
+                deliver(.failure(FrozenCaptureError.captureFailed))
                 return
             }
-            finish(.success(cg))
+            deliver(.success(cg))
         }
 
-        private func finish(_ result: Result<CGImage, Error>) {
-            guard !finished else { return }
-            finished = true
-            continuation?.resume(with: result)
-            continuation = nil
+        private func deliver(_ result: Result<CGImage, Error>) {
+            guard self.result == nil else { return }
+            self.result = result
+            waiter?.resume(with: result)
+            waiter = nil
         }
     }
 
     /// Starts a stream on `filter`, returns its first frame, stops the stream.
+    ///
+    /// 停流**不占按键那条路径**：`stopCapture()` 实测要 10–29ms，而这一帧已经
+    /// 拿到了，用户没有任何理由等它。放到后台去停，帧立刻返回。
     private static func firstFrame(filter: SCContentFilter,
                                    config: SCStreamConfiguration) async throws -> CGImage {
         let stream = SCStream(filter: filter, configuration: config, delegate: nil)
@@ -253,7 +274,7 @@ enum FrozenCapture {
         do {
             try await stream.startCapture()
             let image = try await grabber.firstFrame(timeout: 4)
-            try? await stream.stopCapture()
+            Task.detached(priority: .userInitiated) { try? await stream.stopCapture() }
             return image
         } catch {
             try? await stream.stopCapture()
