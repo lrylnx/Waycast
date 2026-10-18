@@ -2,8 +2,21 @@
 # Build Waycast.app from the SPM package and sign it with the stable local
 # identity ("Waycast Developer"). A fixed signature keeps TCC permissions
 # (screen recording, files & folders) across rebuilds — ad-hoc signing would
-# invalidate them on every update. The identity lives in the login keychain;
-# backup cert: codesign/waycast_codesign.p12 (pass: waycast-local).
+# invalidate them on every update.
+#
+# 2026-10-18：那张证书已不在钥匙串里了，本机改签过几次 ad-hoc —— 结果是
+# 每次重新构建都要去「系统设置 › 隐私与安全性 › 屏幕录制」里**手动删掉旧条目
+# 再重新添加**才能截图。现在重建了一张**自签**证书（CN=Waycast Developer，
+# 有效期 10 年，codeSigning EKU），签出来的 designated requirement 是
+#   identifier "com.waycast.macos" and certificate root = H"4e13aa…"
+# —— 挂在**证书**上而不是 cdhash 上，所以以后重新构建**不用再授权**。
+#
+# 证书私钥备份：codesign/waycast_codesign.p12（口令 waycast-local，`codesign/`
+# 已在 .gitignore 里，**绝不进公开仓库**）。换机器时：
+#   security import codesign/waycast_codesign.p12 -k ~/Library/Keychains/login.keychain-db \
+#            -P waycast-local -T /usr/bin/codesign
+# 注意它不是 Apple 签发的 ⇒ 未公证、首次打开仍要右键「打开」绕 Gatekeeper，
+# 这一点与以前的 ad-hoc 签名没区别。
 set -euo pipefail
 cd "$(dirname "$0")"
 
